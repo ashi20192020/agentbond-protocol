@@ -1,0 +1,22 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/agentbond-types",
+    "programs/agentbond",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+rust-version = "1.84"
+
+[workspace.dependencies]
+agentbond-types = { path = "crates/agentbond-types", default-features = false }
+pinocchio = { version = "=0.10.2", default-features = false, features = ["alloc"] }
+proptest = "1.6"
+sha2 = { version = "0.10.9", default-features = false }
+# Pinocchio 0.10.2 + Agave 2.2 SBF tools (rustc 1.84) require solana-address < 2.6.
+solana-address = { version = "=2.5.0", default-features = false, features = ["syscalls"] }
+# cargo-build-sbf (Cargo 1.84) cannot parse zeroize >= 1.9 edition2024 manifests.
+zeroize = { version = "=1.8.1", default-features = false }

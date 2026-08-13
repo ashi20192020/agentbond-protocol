@@ -1,0 +1,32 @@
+[package]
+name = "agentbond"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "AgentBond Solana program"
+publish = false
+
+[lib]
+crate-type = ["cdylib", "lib"]
+
+[features]
+default = []
+bpf-entrypoint = []
+
+[dependencies]
+agentbond-types = { workspace = true }
+pinocchio = { workspace = true }
+solana-address = { workspace = true }
+zeroize = { workspace = true }
+
+[target.'cfg(not(any(target_os = "solana", target_arch = "bpf")))'.dependencies]
+solana-address = { workspace = true, features = ["curve25519"] }
+
+[dev-dependencies]
+agentbond-types = { workspace = true, features = ["std"] }
+proptest = { workspace = true }
+
+[lints.rust.unexpected_cfgs]
+level = "warn"
+check-cfg = ['cfg(target_os, values("solana"))']
