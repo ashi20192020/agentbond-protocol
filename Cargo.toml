@@ -13,10 +13,26 @@ rust-version = "1.84"
 
 [workspace.dependencies]
 agentbond-types = { path = "crates/agentbond-types", default-features = false }
-pinocchio = { version = "=0.10.2", default-features = false, features = ["alloc"] }
+ed25519-dalek = "=1.0.1"
+litesvm = "=0.6.1"
+pinocchio = { version = "=0.10.2", default-features = false, features = ["alloc", "cpi"] }
+pinocchio-system = { version = "=0.5.0" }
+pinocchio-token = { version = "=0.5.0" }
 proptest = "1.6"
 sha2 = { version = "0.10.9", default-features = false }
 # Pinocchio 0.10.2 + Agave 2.2 SBF tools (rustc 1.84) require solana-address < 2.6.
 solana-address = { version = "=2.5.0", default-features = false, features = ["syscalls"] }
-# cargo-build-sbf (Cargo 1.84) cannot parse zeroize >= 1.9 edition2024 manifests.
+solana-clock = "2.2"
+solana-compute-budget-interface = "2.2"
+solana-instruction = "2.2"
+solana-keypair = "2.2"
+solana-message = "2.2"
+solana-pubkey = "2.2"
+solana-signer = "2.2"
+solana-system-interface = "1"
+solana-transaction = "2.2"
+spl-associated-token-account-client = "2.0"
+spl-token = "7.0"
+# cargo-build-sbf (Cargo 1.84) cannot parse zeroize/zeroize_derive edition2024 manifests.
 zeroize = { version = "=1.8.1", default-features = false }
+zeroize_derive = { version = "=1.4.2" }

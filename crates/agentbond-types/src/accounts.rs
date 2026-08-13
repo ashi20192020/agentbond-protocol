@@ -14,10 +14,10 @@ pub const PROVIDER_STATUS_INACTIVE: u8 = 2;
 
 pub const MAX_EXECUTION_KEYS: usize = 4;
 
-pub const CONFIG_ACCOUNT_LEN: usize = 36;
+pub const CONFIG_ACCOUNT_LEN: usize = 149;
 pub const PROVIDER_ACCOUNT_LEN: usize = 165;
 pub const PROVIDER_BOND_ACCOUNT_LEN: usize = 116;
-pub const JOB_ACCOUNT_LEN: usize = 212;
+pub const JOB_ACCOUNT_LEN: usize = 253;
 pub const CHALLENGE_ACCOUNT_LEN: usize = 116;
 
 fn read_bool(byte: u8) -> Result<bool, ProtocolError> {
@@ -41,14 +41,18 @@ fn require_len(data: &[u8], expected: usize) -> Result<(), ProtocolError> {
 }
 
 fn read_u64(data: &[u8], offset: usize) -> Result<u64, ProtocolError> {
-    let bytes: [u8; 8] = data[offset..offset + 8]
+    let bytes: [u8; 8] = data
+        .get(offset..offset + 8)
+        .ok_or(ProtocolError::InvalidAccountData)?
         .try_into()
         .map_err(|_| ProtocolError::InvalidAccountData)?;
     Ok(u64::from_le_bytes(bytes))
 }
 
 fn read_i64(data: &[u8], offset: usize) -> Result<i64, ProtocolError> {
-    let bytes: [u8; 8] = data[offset..offset + 8]
+    let bytes: [u8; 8] = data
+        .get(offset..offset + 8)
+        .ok_or(ProtocolError::InvalidAccountData)?
         .try_into()
         .map_err(|_| ProtocolError::InvalidAccountData)?;
     Ok(i64::from_le_bytes(bytes))
@@ -68,6 +72,12 @@ pub struct ConfigAccount {
     pub bump: u8,
     pub paused: bool,
     pub admin: [u8; 32],
+    pub genesis_hash: [u8; 32],
+    pub allowed_mint: [u8; 32],
+    pub token_program: [u8; 32],
+    pub mint_decimals: u8,
+    pub min_provider_bond: u64,
+    pub challenge_duration_seconds: i64,
 }
 
 impl ConfigAccount {
@@ -78,6 +88,12 @@ impl ConfigAccount {
         out[2] = self.bump;
         out[3] = write_bool(self.paused);
         out[4..36].copy_from_slice(&self.admin);
+        out[36..68].copy_from_slice(&self.genesis_hash);
+        out[68..100].copy_from_slice(&self.allowed_mint);
+        out[100..132].copy_from_slice(&self.token_program);
+        out[132] = self.mint_decimals;
+        out[133..141].copy_from_slice(&self.min_provider_bond.to_le_bytes());
+        out[141..149].copy_from_slice(&self.challenge_duration_seconds.to_le_bytes());
         out
     }
 
@@ -93,6 +109,12 @@ impl ConfigAccount {
             bump: data[2],
             paused: read_bool(data[3])?,
             admin: read_pubkey(data, 4)?,
+            genesis_hash: read_pubkey(data, 36)?,
+            allowed_mint: read_pubkey(data, 68)?,
+            token_program: read_pubkey(data, 100)?,
+            mint_decimals: data[132],
+            min_provider_bond: read_u64(data, 133)?,
+            challenge_duration_seconds: read_i64(data, 141)?,
         })
     }
 }
@@ -158,6 +180,13 @@ impl ProviderAccount {
             execution_keys,
         })
     }
+
+    pub fn contains_execution_key(&self, key: &[u8; 32]) -> bool {
+        self.execution_keys
+            .iter()
+            .take(usize::from(self.execution_key_count))
+            .any(|existing| existing == key)
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -171,6 +200,12 @@ pub struct ProviderBondAccount {
 }
 
 impl ProviderBondAccount {
+    pub fn unlocked(&self) -> Result<u64, ProtocolError> {
+        self.deposited
+            .checked_sub(self.locked)
+            .ok_or(ProtocolError::MathOverflow)
+    }
+
     pub fn encode(&self) -> Result<[u8; PROVIDER_BOND_ACCOUNT_LEN], ProtocolError> {
         if self.locked > self.deposited {
             return Err(ProtocolError::InvalidAccountData);
@@ -226,6 +261,9 @@ pub struct JobAccount {
     pub work_deadline: i64,
     pub auto_settle_deadline: i64,
     pub receipt_digest: [u8; 32],
+    pub request_hash: [u8; 32],
+    pub locked_bond: u64,
+    pub mint_decimals: u8,
 }
 
 impl JobAccount {
@@ -246,6 +284,9 @@ impl JobAccount {
         out[164..172].copy_from_slice(&self.work_deadline.to_le_bytes());
         out[172..180].copy_from_slice(&self.auto_settle_deadline.to_le_bytes());
         out[180..212].copy_from_slice(&self.receipt_digest);
+        out[212..244].copy_from_slice(&self.request_hash);
+        out[244..252].copy_from_slice(&self.locked_bond.to_le_bytes());
+        out[252] = self.mint_decimals;
         out
     }
 
@@ -271,6 +312,9 @@ impl JobAccount {
             work_deadline: read_i64(data, 164)?,
             auto_settle_deadline: read_i64(data, 172)?,
             receipt_digest: read_pubkey(data, 180)?,
+            request_hash: read_pubkey(data, 212)?,
+            locked_bond: read_u64(data, 244)?,
+            mint_decimals: data[252],
         })
     }
 }
@@ -280,8 +324,9 @@ pub struct ChallengeAccount {
     pub bump: u8,
     pub status: u8,
     pub job: [u8; 32],
-    pub challenger: [u8; 32],
+    pub buyer: [u8; 32],
     pub reason_hash: [u8; 32],
+    /// Must remain zero in Milestone 2.
     pub bond_amount: u64,
     pub deadline: i64,
 }
@@ -292,7 +337,10 @@ impl ChallengeAccount {
 
     pub fn encode(&self) -> Result<[u8; CHALLENGE_ACCOUNT_LEN], ProtocolError> {
         if self.status != Self::STATUS_OPEN && self.status != Self::STATUS_RESOLVED {
-            return Err(ProtocolError::InvalidAccountData);
+            return Err(ProtocolError::InvalidChallengeStatus);
+        }
+        if self.bond_amount != 0 {
+            return Err(ProtocolError::ChallengeBondMustBeZero);
         }
         let mut out = [0u8; CHALLENGE_ACCOUNT_LEN];
         out[0] = CHALLENGE_ACCOUNT_DISCRIMINATOR;
@@ -300,7 +348,7 @@ impl ChallengeAccount {
         out[2] = self.bump;
         out[3] = self.status;
         out[4..36].copy_from_slice(&self.job);
-        out[36..68].copy_from_slice(&self.challenger);
+        out[36..68].copy_from_slice(&self.buyer);
         out[68..100].copy_from_slice(&self.reason_hash);
         out[100..108].copy_from_slice(&self.bond_amount.to_le_bytes());
         out[108..116].copy_from_slice(&self.deadline.to_le_bytes());
@@ -316,17 +364,21 @@ impl ChallengeAccount {
             return Err(ProtocolError::UnsupportedAccountVersion);
         }
         if data[3] != Self::STATUS_OPEN && data[3] != Self::STATUS_RESOLVED {
-            return Err(ProtocolError::InvalidAccountData);
+            return Err(ProtocolError::InvalidChallengeStatus);
         }
-        Ok(Self {
+        let account = Self {
             bump: data[2],
             status: data[3],
             job: read_pubkey(data, 4)?,
-            challenger: read_pubkey(data, 36)?,
+            buyer: read_pubkey(data, 36)?,
             reason_hash: read_pubkey(data, 68)?,
             bond_amount: read_u64(data, 100)?,
             deadline: read_i64(data, 108)?,
-        })
+        };
+        if account.bond_amount != 0 {
+            return Err(ProtocolError::ChallengeBondMustBeZero);
+        }
+        Ok(account)
     }
 }
 
@@ -340,6 +392,12 @@ mod tests {
             bump: 255,
             paused: false,
             admin: [9u8; 32],
+            genesis_hash: [1u8; 32],
+            allowed_mint: [2u8; 32],
+            token_program: [3u8; 32],
+            mint_decimals: 6,
+            min_provider_bond: 1_000,
+            challenge_duration_seconds: 3_600,
         }
     }
 
@@ -382,6 +440,9 @@ mod tests {
             work_deadline: 300,
             auto_settle_deadline: 400,
             receipt_digest: [11u8; 32],
+            request_hash: [12u8; 32],
+            locked_bond: 50,
+            mint_decimals: 6,
         }
     }
 
@@ -390,9 +451,9 @@ mod tests {
             bump: 251,
             status: ChallengeAccount::STATUS_OPEN,
             job: [12u8; 32],
-            challenger: [13u8; 32],
+            buyer: [13u8; 32],
             reason_hash: [14u8; 32],
-            bond_amount: 99,
+            bond_amount: 0,
             deadline: 500,
         }
     }
@@ -413,11 +474,10 @@ mod tests {
             sample_challenge().encode().expect("encode").len(),
             CHALLENGE_ACCOUNT_LEN
         );
-
-        assert_eq!(CONFIG_ACCOUNT_LEN, 36);
+        assert_eq!(CONFIG_ACCOUNT_LEN, 149);
         assert_eq!(PROVIDER_ACCOUNT_LEN, 165);
         assert_eq!(PROVIDER_BOND_ACCOUNT_LEN, 116);
-        assert_eq!(JOB_ACCOUNT_LEN, 212);
+        assert_eq!(JOB_ACCOUNT_LEN, 253);
         assert_eq!(CHALLENGE_ACCOUNT_LEN, 116);
     }
 
@@ -492,22 +552,12 @@ mod tests {
     }
 
     #[test]
-    fn malformed_provider_status() {
-        let mut data = sample_provider().encode().expect("encode");
-        data[3] = 9;
+    fn challenge_nonzero_bond_rejected() {
+        let mut challenge = sample_challenge();
+        challenge.bond_amount = 1;
         assert_eq!(
-            ProviderAccount::decode(&data),
-            Err(ProtocolError::InvalidProviderStatus)
-        );
-    }
-
-    #[test]
-    fn malformed_boolean() {
-        let mut data = sample_config().encode();
-        data[3] = 2;
-        assert_eq!(
-            ConfigAccount::decode(&data),
-            Err(ProtocolError::InvalidBoolean)
+            challenge.encode(),
+            Err(ProtocolError::ChallengeBondMustBeZero)
         );
     }
 

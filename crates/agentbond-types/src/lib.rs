@@ -17,9 +17,15 @@ pub use accounts::{
     PROVIDER_STATUS_INACTIVE,
 };
 pub use error::ProtocolError;
-pub use events::ProtocolEvent;
+pub use events::{ProtocolEvent, ProtocolEventKind, EVENT_ENCODED_LEN, EVENT_VERSION};
 pub use instruction::{
-    parse_instruction, Instruction, InstructionKind, INSTRUCTION_DISCRIMINATOR_LEN,
+    encode_add_execution_key, encode_challenge_work, encode_create_job, encode_deposit_bond,
+    encode_empty, encode_initialize_config, encode_revoke_execution_key, encode_set_paused,
+    encode_submit_receipt, encode_withdraw_bond, parse_instruction, CreateJobPayload,
+    InitializeConfigPayload, Instruction, InstructionKind, ADD_EXECUTION_KEY_PAYLOAD_LEN,
+    CHALLENGE_WORK_PAYLOAD_LEN, CREATE_JOB_PAYLOAD_LEN, DEPOSIT_BOND_PAYLOAD_LEN,
+    INITIALIZE_CONFIG_PAYLOAD_LEN, INSTRUCTION_DISCRIMINATOR_LEN, REVOKE_EXECUTION_KEY_PAYLOAD_LEN,
+    SET_PAUSED_PAYLOAD_LEN, SUBMIT_RECEIPT_PAYLOAD_LEN, WITHDRAW_BOND_PAYLOAD_LEN,
 };
 pub use pda::{
     bond_seed_parts, challenge_seed_parts, config_seed_parts, job_nonce_le_bytes, job_seed_parts,

@@ -6,47 +6,64 @@ This repository is early. It is not production-ready and has not been audited.
 
 ## Current status
 
-**Milestone 1**
+**Milestone 2**
 
-Milestone 1 provides the shared protocol foundation and a minimal Pinocchio program shell. It does not move tokens, settle jobs, or expose network services.
+Milestone 2 replaces the Milestone 1 dispatch shell with a working Pinocchio escrow program. It supports configuration, provider registration, bonds, job funding, signed receipt submission, settlement, refunds, challenges, admin slash, and terminal account closure.
 
-Milestone 1 contains:
+Milestone 1 shared types remain the source of truth for layouts, receipts, and state rules.
 
-- Cargo workspace
-- Shared protocol types in `crates/agentbond-types`
-- Canonical `AgentBondWorkReceiptV1` codec and SHA-256 digest helpers
-- Job state transition rules
-- Fixed account layouts
-- Instruction discriminators and parsing
-- PDA seed constants and derivation helpers
-- Minimal Pinocchio entrypoint with instruction dispatch scaffolding
+## Implemented onchain instructions
 
-## Workspace structure
+- `InitializeConfig`, `SetPaused`
+- `RegisterProvider`, `AddExecutionKey`, `RevokeExecutionKey`
+- `DepositBond`, `WithdrawBond`
+- `CreateJob`, `FundJob`, `AcceptJob`
+- `SubmitReceipt` (Ed25519 precompile + Instructions sysvar)
+- `AcceptWork`, `ChallengeWork`
+- `ResolveTimeoutSettle`, `ResolveTimeoutRefund`
+- `ExpireUnfunded`, `ExpireUnaccepted`
+- `SlashBond`, `CloseJob`
+
+## Account model
+
+| Account | Seeds | Notes |
+|---|---|---|
+| Config | `["config"]` | Singleton; read-only on common job ops |
+| Provider | `["provider", authority]` | Up to 4 execution keys |
+| ProviderBond | `["bond", authority, mint]` | Tracks deposited/locked; vault is ATA(bond PDA) |
+| Job | `["job", buyer, provider, nonce_le]` | Job PDA is escrow ATA authority |
+| Challenge | `["challenge", job]` | `bond_amount` must remain 0 in M2 |
+
+Escrow token account: ATA(job PDA, configured mint, legacy Token Program).
+
+## Job state flow
 
 ```text
-.
-├── crates/agentbond-types   # shared protocol types and codecs
-├── programs/agentbond       # Pinocchio program shell
-├── Cargo.toml               # workspace manifest
-├── LICENSE
-└── README.md
+Created -> Funded -> Accepted -> Submitted -> Settled
+                                  |            ^
+                                  +-> Challenged -> Settled / Refunded / Slashed
+Created -> Expired
+Funded / Accepted -> Refunded (timeouts)
 ```
 
-## Build and test
+## Security invariants
 
-Host checks:
+- Principal accounting always uses `job.amount`.
+- Unsolicited escrow dust is returned to the buyer and cannot inflate principal.
+- Checked arithmetic for amounts and timestamps.
+- Pause blocks register/deposit/create/fund/accept; it does not block submit, settle, refund, withdraw unlocked bond, or close.
+- Legacy SPL Token only (`Tokenkeg...`). Token-2022 is rejected.
+- SubmitReceipt requires the Ed25519 instruction immediately before AgentBond and validates the full 334-byte receipt message.
+- Slash is admin-only while Challenged and before the challenge deadline.
+- Config is not writable on common job operations.
 
-```bash
-cargo fmt --all -- --check
-cargo clippy --workspace --all-targets --all-features -- -D warnings
-cargo test --workspace --all-features
-```
+## Legacy SPL Token limitation
 
-Solana program build (requires the Solana/Agave SBF toolchain):
+Milestone 2 supports only the legacy SPL Token program and one configured settlement mint. Token-2022, transfer hooks, confidential transfers, and arbitrary mints are out of scope.
 
-```bash
-cargo build-sbf --manifest-path programs/agentbond/Cargo.toml --features bpf-entrypoint
-```
+## Centralized challenge arbitration limitation
+
+`SlashBond` is centralized MVP arbitration by the Config admin. A challenge is a subjective claim. Neither a challenge nor a slash objectively proves that work was incorrect.
 
 ## Receipt claim boundary
 
@@ -62,6 +79,50 @@ x402 or MPP micropayments and AgentBond onchain escrow are separate payment rail
 - Expensive jobs use AgentBond escrow and the job state machine.
 
 Do not treat a standard x402 transfer as AgentBond escrow funding.
+
+## Workspace structure
+
+```text
+.
+├── crates/agentbond-types   # shared protocol types and codecs
+├── programs/agentbond       # Pinocchio program + LiteSVM tests
+├── Cargo.toml
+├── LICENSE
+└── README.md
+```
+
+## Build and test
+
+Host checks:
+
+```bash
+cargo fmt --all -- --check
+cargo clippy --workspace --all-targets --all-features -- -D warnings
+cargo build-sbf --manifest-path programs/agentbond/Cargo.toml --features bpf-entrypoint
+cargo test --workspace --all-features
+```
+
+Build the SBF binary before integration tests so LiteSVM can load `target/deploy/agentbond.so`.
+
+## Program binary size
+
+After `cargo build-sbf --features bpf-entrypoint`:
+
+- `target/deploy/agentbond.so` ≈ **145 KB** (measured during Milestone 2 verification)
+
+## Compute-unit results
+
+Representative LiteSVM measurements from Milestone 2 tests (subject to change):
+
+| Instruction | CU (approx.) |
+|---|---|
+| FundJob | ~17k |
+| SubmitReceipt | ~48k |
+| AcceptWork | ~27k |
+| ChallengeWork | ~10k |
+| ResolveTimeoutSettle | ~21k–27k |
+| ResolveTimeoutRefund | ~16k–19k |
+| SlashBond | ~37k |
 
 ## License
 
