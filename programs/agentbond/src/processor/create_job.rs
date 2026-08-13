@@ -13,8 +13,8 @@ use crate::accounts::{
 use crate::error::fail;
 use crate::events;
 use crate::processor::helpers::{
-    load_validated_config, load_validated_provider, next_account, now_ts, require_not_paused,
-    save_job,
+    load_validated_config_readonly, load_validated_provider, next_account, now_ts,
+    require_not_paused, save_job,
 };
 use crate::token::require_legacy_token_program_id;
 
@@ -33,7 +33,7 @@ pub fn process(
     require_signer(buyer)?;
     require_system_program(system_program)?;
 
-    let config = load_validated_config(program_id, config_account)?;
+    let config = load_validated_config_readonly(program_id, config_account)?;
     require_not_paused(&config)?;
     require_legacy_token_program_id(&config.token_program)?;
 

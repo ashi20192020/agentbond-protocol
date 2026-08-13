@@ -12,6 +12,8 @@ Milestone 2 replaces the Milestone 1 dispatch shell with a working Pinocchio esc
 
 Milestone 1 shared types remain the source of truth for layouts, receipts, and state rules.
 
+The Milestone 2 security suite is extensive (host codecs, Ed25519 layout parsing, and LiteSVM integration tests) but is **not an audit**.
+
 ## Implemented onchain instructions
 
 - `InitializeConfig`, `SetPaused`
@@ -104,25 +106,30 @@ cargo test --workspace --all-features
 
 Build the SBF binary before integration tests so LiteSVM can load `target/deploy/agentbond.so`.
 
+Latest Milestone 2 verification counted **127** workspace tests (`cargo test --workspace --all-features`), including **77** LiteSVM integration tests under `programs/agentbond/tests/`.
+
 ## Program binary size
 
 After `cargo build-sbf --features bpf-entrypoint`:
 
-- `target/deploy/agentbond.so` ≈ **145 KB** (measured during Milestone 2 verification)
+- `target/deploy/agentbond.so` = **145,976 bytes** (`wc -c`, Milestone 2 completion run)
 
 ## Compute-unit results
 
-Representative LiteSVM measurements from Milestone 2 tests (subject to change):
+Measured once via `programs/agentbond/tests/compute_units.rs` on LiteSVM (values can vary slightly across runs):
 
-| Instruction | CU (approx.) |
+| Instruction | Measured CU |
 |---|---|
-| FundJob | ~17k |
-| SubmitReceipt | ~48k |
-| AcceptWork | ~27k |
-| ChallengeWork | ~10k |
-| ResolveTimeoutSettle | ~21k–27k |
-| ResolveTimeoutRefund | ~16k–19k |
-| SlashBond | ~37k |
+| FundJob | 18,798 |
+| AcceptJob | 8,810 |
+| SubmitReceipt | 48,159 |
+| AcceptWork | 22,330 |
+| ChallengeWork | 8,090 |
+| ResolveTimeoutSettle (Submitted) | 17,856 |
+| ResolveTimeoutSettle (Challenged) | 24,364 |
+| ResolveTimeoutRefund (Funded) | 17,704 |
+| ResolveTimeoutRefund (Accepted) | 22,215 |
+| SlashBond | 42,686 |
 
 ## License
 

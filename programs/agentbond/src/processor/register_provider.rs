@@ -13,7 +13,7 @@ use crate::accounts::{
 use crate::error::fail;
 use crate::events;
 use crate::processor::helpers::{
-    load_validated_config, next_account, now_ts, require_not_paused, save_provider,
+    load_validated_config_readonly, next_account, now_ts, require_not_paused, save_provider,
 };
 
 pub fn process(program_id: &Address, accounts: &[AccountView]) -> ProgramResult {
@@ -26,7 +26,7 @@ pub fn process(program_id: &Address, accounts: &[AccountView]) -> ProgramResult 
     require_signer(authority)?;
     require_system_program(system_program)?;
 
-    let config = load_validated_config(program_id, config_account)?;
+    let config = load_validated_config_readonly(program_id, config_account)?;
     require_not_paused(&config)?;
 
     let authority_bytes = authority.address().to_bytes();

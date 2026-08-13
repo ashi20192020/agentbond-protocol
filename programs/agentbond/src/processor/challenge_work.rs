@@ -14,8 +14,8 @@ use crate::accounts::{
 use crate::error::fail;
 use crate::events;
 use crate::processor::helpers::{
-    load_validated_config, load_validated_job, next_account, now_ts, save_challenge, save_job,
-    transition_job,
+    load_validated_config_readonly, load_validated_job, next_account, now_ts, save_challenge,
+    save_job, transition_job,
 };
 
 pub fn process(
@@ -34,7 +34,7 @@ pub fn process(
     require_writable(job_account)?;
     require_system_program(system_program)?;
 
-    let config = load_validated_config(program_id, config_account)?;
+    let config = load_validated_config_readonly(program_id, config_account)?;
     let mut job = load_validated_job(program_id, job_account)?;
     if job.buyer.as_ref() != buyer.address().as_ref() {
         return Err(fail(ProtocolError::Unauthorized));

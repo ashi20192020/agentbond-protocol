@@ -13,7 +13,7 @@ use crate::constants::SYSTEM_PROGRAM_ID;
 use crate::error::fail;
 use crate::events;
 use crate::processor::helpers::{
-    job_nonce_bytes, load_validated_bond, load_validated_challenge, load_validated_config,
+    job_nonce_bytes, load_validated_bond, load_validated_challenge, load_validated_config_readonly,
     load_validated_job, next_account, now_ts, refund_principal_to_buyer, save_bond, save_job,
     transition_job, unlock_job_bond,
 };
@@ -269,7 +269,7 @@ pub fn slash_bond(program_id: &Address, accounts: &[AccountView]) -> ProgramResu
     require_writable(challenge_account)?;
     require_legacy_token_program(token_program)?;
 
-    let config = load_validated_config(program_id, config_account)?;
+    let config = load_validated_config_readonly(program_id, config_account)?;
     if admin.address().as_ref() != config.admin.as_ref() {
         return Err(fail(ProtocolError::Unauthorized));
     }

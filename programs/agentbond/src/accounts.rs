@@ -25,6 +25,13 @@ pub fn require_writable(account: &AccountView) -> Result<(), pinocchio::error::P
     Ok(())
 }
 
+pub fn require_readonly(account: &AccountView) -> Result<(), pinocchio::error::ProgramError> {
+    if account.is_writable() {
+        return Err(fail(ProtocolError::InvalidConfig));
+    }
+    Ok(())
+}
+
 pub fn require_system_program(account: &AccountView) -> Result<(), pinocchio::error::ProgramError> {
     if account.address() != &SYSTEM_PROGRAM_ID {
         return Err(fail(ProtocolError::InvalidOwner));

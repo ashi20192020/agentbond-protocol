@@ -7,8 +7,9 @@ use crate::accounts::{require_signer, require_writable};
 use crate::error::fail;
 use crate::events;
 use crate::processor::helpers::{
-    load_validated_bond, load_validated_config, load_validated_job, load_validated_provider,
-    next_account, now_ts, require_not_paused, save_bond, save_job, transition_job,
+    load_validated_bond, load_validated_config_readonly, load_validated_job,
+    load_validated_provider, next_account, now_ts, require_not_paused, save_bond, save_job,
+    transition_job,
 };
 
 pub fn process(program_id: &Address, accounts: &[AccountView]) -> ProgramResult {
@@ -23,7 +24,7 @@ pub fn process(program_id: &Address, accounts: &[AccountView]) -> ProgramResult 
     require_writable(bond_account)?;
     require_writable(job_account)?;
 
-    let config = load_validated_config(program_id, config_account)?;
+    let config = load_validated_config_readonly(program_id, config_account)?;
     require_not_paused(&config)?;
 
     let provider = load_validated_provider(program_id, provider_account)?;

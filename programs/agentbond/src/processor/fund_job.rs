@@ -7,8 +7,8 @@ use crate::accounts::{require_signer, require_writable};
 use crate::error::fail;
 use crate::events;
 use crate::processor::helpers::{
-    load_validated_config, load_validated_job, next_account, now_ts, require_not_paused, save_job,
-    transition_job,
+    load_validated_config_readonly, load_validated_job, next_account, now_ts, require_not_paused,
+    save_job, transition_job,
 };
 use crate::token::{
     require_legacy_token_program, token_amount, transfer_checked, validate_ata, validate_mint,
@@ -29,7 +29,7 @@ pub fn process(program_id: &Address, accounts: &[AccountView]) -> ProgramResult 
     require_writable(job_account)?;
     require_legacy_token_program(token_program)?;
 
-    let config = load_validated_config(program_id, config_account)?;
+    let config = load_validated_config_readonly(program_id, config_account)?;
     require_not_paused(&config)?;
 
     let mut job = load_validated_job(program_id, job_account)?;

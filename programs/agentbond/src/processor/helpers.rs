@@ -8,9 +8,9 @@ use pinocchio::address::Address;
 use pinocchio::error::ProgramResult;
 
 use crate::accounts::{
-    address_from_bytes, job_signer_seeds, require_keys_eq, require_owner, require_writable,
-    validate_bond_pda, validate_challenge_pda, validate_config_pda, validate_job_pda,
-    validate_provider_pda, write_account_data,
+    address_from_bytes, job_signer_seeds, require_keys_eq, require_owner, require_readonly,
+    require_writable, validate_bond_pda, validate_challenge_pda, validate_config_pda,
+    validate_job_pda, validate_provider_pda, write_account_data,
 };
 use crate::error::fail;
 use crate::token::{
@@ -126,6 +126,15 @@ pub fn load_validated_config(
     let config = load_config(account)?;
     validate_config_pda(program_id, account, config.bump)?;
     Ok(config)
+}
+
+/// Config must stay read-only on common job and provider entry paths.
+pub fn load_validated_config_readonly(
+    program_id: &Address,
+    account: &AccountView,
+) -> Result<ConfigAccount, pinocchio::error::ProgramError> {
+    require_readonly(account)?;
+    load_validated_config(program_id, account)
 }
 
 pub fn load_validated_provider(

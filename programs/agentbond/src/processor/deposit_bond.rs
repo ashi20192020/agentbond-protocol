@@ -15,8 +15,8 @@ use crate::constants::SYSTEM_PROGRAM_ID;
 use crate::error::fail;
 use crate::events;
 use crate::processor::helpers::{
-    load_validated_bond, load_validated_config, load_validated_provider, next_account, now_ts,
-    require_not_paused, save_bond,
+    load_validated_bond, load_validated_config_readonly, load_validated_provider, next_account,
+    now_ts, require_not_paused, save_bond,
 };
 use crate::token::{
     associated_token_address, require_legacy_token_program, transfer_checked, validate_ata,
@@ -43,7 +43,7 @@ pub fn process(program_id: &Address, accounts: &[AccountView], amount: u64) -> P
         return Err(fail(ProtocolError::InvalidAmount));
     }
 
-    let config = load_validated_config(program_id, config_account)?;
+    let config = load_validated_config_readonly(program_id, config_account)?;
     require_not_paused(&config)?;
     if token_program.address().as_ref() != config.token_program {
         return Err(fail(ProtocolError::InvalidTokenProgram));
