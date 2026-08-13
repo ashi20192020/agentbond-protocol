@@ -4,7 +4,8 @@ use std::sync::Arc;
 use agentbond_app::{AppConfig, ServiceCatalog};
 use agentbond_gateway::{AppState, router};
 use agentbond_payments::{
-    FacilitatorClient, HttpFacilitatorClient, MockFacilitatorClient, PaymentCache,
+    ChallengeStore, FacilitatorClient, HttpFacilitatorClient, MockFacilitatorClient,
+    SettlementStore,
 };
 use agentbond_sdk::{ChainReader, HttpChainReader, MockChainReader};
 use tracing::{info, warn};
@@ -38,7 +39,12 @@ async fn main() -> anyhow::Result<()> {
     } else {
         (
             Arc::new(HttpChainReader::new(&cfg.rpc_url, timeout)?),
-            Arc::new(HttpFacilitatorClient::new(&cfg.facilitator_url, timeout)?),
+            Arc::new(HttpFacilitatorClient::new(
+                &cfg.facilitator_url,
+                timeout,
+                &cfg.x402_network,
+                Some(cfg.x402_fee_payer.clone()),
+            )?),
         )
     };
 
@@ -47,8 +53,8 @@ async fn main() -> anyhow::Result<()> {
         catalog: Arc::new(catalog),
         reader,
         facilitator,
-        payment_cache: Arc::new(PaymentCache::new()),
-        requirements_issued_at: Arc::new(tokio::sync::Mutex::new(None)),
+        challenges: Arc::new(ChallengeStore::new()),
+        settlements: Arc::new(SettlementStore::new()),
     };
 
     let app = router(state, cfg.max_request_bytes, timeout);

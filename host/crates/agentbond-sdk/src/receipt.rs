@@ -30,6 +30,11 @@ pub fn build_ed25519_verify_instruction(
             "receipt message must be {RECEIPT_ENCODED_LEN} bytes"
         )));
     }
+    if public_key == &[0u8; 32] {
+        return Err(SdkError::InvalidInput(
+            "execution public key must be nonzero".into(),
+        ));
+    }
     const OFFSETS_START: usize = 2;
     const OFFSETS_SIZE: usize = 14;
     const DATA_START: usize = OFFSETS_START + OFFSETS_SIZE;
@@ -63,8 +68,56 @@ pub fn build_submit_receipt_plan(
     execution_pubkey: &[u8; 32],
     signature: &[u8; 64],
 ) -> Result<InstructionPlan, SdkError> {
+    build_submit_receipt_plan_at(
+        program_id,
+        job,
+        provider_authority,
+        receipt,
+        execution_pubkey,
+        signature,
+        None,
+    )
+}
+
+pub fn build_submit_receipt_plan_at(
+    program_id: &Pubkey,
+    job: &Pubkey,
+    provider_authority: &Pubkey,
+    receipt: &AgentBondWorkReceiptV1,
+    execution_pubkey: &[u8; 32],
+    signature: &[u8; 64],
+    now: Option<i64>,
+) -> Result<InstructionPlan, SdkError> {
     validate_receipt(receipt)?;
+    if receipt.program_id != program_id.to_bytes() {
+        return Err(SdkError::InvalidInput(
+            "receipt program_id does not match requested program".into(),
+        ));
+    }
+    if receipt.job != job.to_bytes() {
+        return Err(SdkError::InvalidInput(
+            "receipt job does not match supplied job".into(),
+        ));
+    }
+    if receipt.provider != provider_authority.to_bytes() {
+        return Err(SdkError::InvalidInput(
+            "receipt provider does not match supplied provider".into(),
+        ));
+    }
+    if execution_pubkey == &[0u8; 32] {
+        return Err(SdkError::InvalidInput(
+            "execution public key must be nonzero".into(),
+        ));
+    }
+    if now.is_some_and(|ts| ts > receipt.expires_at) {
+        return Err(SdkError::InvalidInput("receipt is expired".into()));
+    }
     let encoded = receipt.encode()?;
+    if encoded.len() != RECEIPT_ENCODED_LEN {
+        return Err(SdkError::InvalidInput(format!(
+            "canonical receipt must be {RECEIPT_ENCODED_LEN} bytes"
+        )));
+    }
     let ed = build_ed25519_verify_instruction(&encoded, execution_pubkey, signature)?;
     let config = config_pda(program_id)?.address;
     let provider = provider_pda(program_id, provider_authority)?.address;
@@ -79,7 +132,6 @@ pub fn build_submit_receipt_plan(
         ],
         data: encode_submit_receipt(receipt)?.to_vec(),
     };
-    // SubmitReceipt does not require a Solana tx signer for the execution key.
     Ok(InstructionPlan::new(
         "submit_receipt",
         program_id,

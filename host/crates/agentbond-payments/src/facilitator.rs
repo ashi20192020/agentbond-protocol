@@ -4,7 +4,12 @@ use std::time::Duration;
 use tokio::sync::Mutex;
 
 use crate::error::PaymentError;
-use crate::models::{SettleRequest, SettleResponse, VerifyRequest, VerifyResponse};
+use crate::http_util::{
+    MAX_FACILITATOR_BODY, build_http_client, read_body_bounded, reject_credentialed_url,
+};
+use crate::models::{
+    SCHEME_EXACT, SettleRequest, SettleResponse, SupportedResponse, VerifyRequest, VerifyResponse,
+};
 
 #[async_trait]
 pub trait FacilitatorClient: Send + Sync {
@@ -16,44 +21,76 @@ pub trait FacilitatorClient: Send + Sync {
 pub struct HttpFacilitatorClient {
     client: reqwest::Client,
     base_url: String,
+    expected_network: String,
+    expected_fee_payer: Option<String>,
 }
 
 impl HttpFacilitatorClient {
-    pub fn new(base_url: impl Into<String>, timeout: Duration) -> Result<Self, PaymentError> {
+    pub fn new(
+        base_url: impl Into<String>,
+        timeout: Duration,
+        expected_network: impl Into<String>,
+        expected_fee_payer: Option<String>,
+    ) -> Result<Self, PaymentError> {
         let base_url = base_url.into();
-        if !(base_url.starts_with("http://") || base_url.starts_with("https://")) {
-            return Err(PaymentError::Config(
-                "facilitator URL must be http(s)".into(),
-            ));
-        }
-        let client = reqwest::Client::builder()
-            .timeout(timeout)
-            .build()
-            .map_err(|e| PaymentError::Facilitator(e.to_string()))?;
-        Ok(Self { client, base_url })
+        reject_credentialed_url(&base_url)?;
+        let client = build_http_client(timeout)?;
+        Ok(Self {
+            client,
+            base_url,
+            expected_network: expected_network.into(),
+            expected_fee_payer,
+        })
     }
 
     async fn post_json<T: for<'de> serde::Deserialize<'de>, B: serde::Serialize>(
         &self,
         path: &str,
         body: &B,
+        timeout_kind: TimeoutKind,
     ) -> Result<T, PaymentError> {
         let url = format!("{}{}", self.base_url.trim_end_matches('/'), path);
         let response = self.client.post(url).json(body).send().await.map_err(|e| {
             if e.is_timeout() {
-                PaymentError::VerifyTimeout
+                match timeout_kind {
+                    TimeoutKind::Verify => PaymentError::VerifyTimeout,
+                    TimeoutKind::Settle => PaymentError::SettleTimeout,
+                }
             } else {
                 PaymentError::Facilitator(e.to_string())
             }
         })?;
+        if response.status().is_redirection() {
+            return Err(PaymentError::Facilitator(
+                "facilitator redirects are not allowed".into(),
+            ));
+        }
         let status = response.status();
-        let bytes = response
-            .bytes()
+        let bytes = read_body_bounded(response, MAX_FACILITATOR_BODY).await?;
+        if !status.is_success() {
+            return Err(PaymentError::Facilitator(format!("http {status}")));
+        }
+        serde_json::from_slice(&bytes).map_err(|e| PaymentError::Facilitator(e.to_string()))
+    }
+
+    async fn get_json<T: for<'de> serde::Deserialize<'de>>(
+        &self,
+        path: &str,
+    ) -> Result<T, PaymentError> {
+        let url = format!("{}{}", self.base_url.trim_end_matches('/'), path);
+        let response = self
+            .client
+            .get(url)
+            .send()
             .await
             .map_err(|e| PaymentError::Facilitator(e.to_string()))?;
-        if bytes.len() > 64 * 1024 {
-            return Err(PaymentError::Facilitator("response too large".into()));
+        if response.status().is_redirection() {
+            return Err(PaymentError::Facilitator(
+                "facilitator redirects are not allowed".into(),
+            ));
         }
+        let status = response.status();
+        let bytes = read_body_bounded(response, MAX_FACILITATOR_BODY).await?;
         if !status.is_success() {
             return Err(PaymentError::Facilitator(format!("http {status}")));
         }
@@ -61,38 +98,41 @@ impl HttpFacilitatorClient {
     }
 }
 
+enum TimeoutKind {
+    Verify,
+    Settle,
+}
+
 #[async_trait]
 impl FacilitatorClient for HttpFacilitatorClient {
     async fn verify(&self, request: &VerifyRequest) -> Result<VerifyResponse, PaymentError> {
-        self.post_json("/verify", request)
+        self.post_json("/verify", request, TimeoutKind::Verify)
             .await
-            .map_err(|e| match e {
-                PaymentError::VerifyTimeout => PaymentError::VerifyTimeout,
-                other => other,
-            })
     }
 
     async fn settle(&self, request: &SettleRequest) -> Result<SettleResponse, PaymentError> {
-        self.post_json("/settle", request)
+        self.post_json("/settle", request, TimeoutKind::Settle)
             .await
-            .map_err(|e| match e {
-                PaymentError::VerifyTimeout => PaymentError::SettleTimeout,
-                other => other,
-            })
     }
 
     async fn ready(&self) -> Result<(), PaymentError> {
-        let url = format!("{}/health", self.base_url.trim_end_matches('/'));
-        let response = self
-            .client
-            .get(url)
-            .send()
-            .await
-            .map_err(|e| PaymentError::Facilitator(e.to_string()))?;
-        if response.status().is_success() {
+        // Facilitator supported-capabilities endpoint (not a custom /health).
+        let supported: SupportedResponse = self.get_json("/supported").await?;
+        let ok = supported.kinds.iter().any(|k| {
+            k.scheme == SCHEME_EXACT
+                && k.network == self.expected_network
+                && match (&self.expected_fee_payer, &k.fee_payer) {
+                    (Some(expected), Some(actual)) => expected == actual,
+                    (Some(_), None) => false,
+                    (None, _) => true,
+                }
+        });
+        if ok {
             Ok(())
         } else {
-            Err(PaymentError::Facilitator("facilitator not ready".into()))
+            Err(PaymentError::Facilitator(
+                "supported kinds do not include exact/network pair".into(),
+            ))
         }
     }
 }
@@ -106,6 +146,8 @@ pub struct MockFacilitatorClient {
     ready: Arc<Mutex<bool>>,
     verify_calls: Arc<Mutex<u64>>,
     settle_calls: Arc<Mutex<u64>>,
+    network: Arc<Mutex<String>>,
+    fee_payer: Arc<Mutex<Option<String>>>,
 }
 
 impl MockFacilitatorClient {
@@ -118,33 +160,35 @@ impl MockFacilitatorClient {
             ready: Arc::new(Mutex::new(true)),
             verify_calls: Arc::new(Mutex::new(0)),
             settle_calls: Arc::new(Mutex::new(0)),
+            network: Arc::new(Mutex::new("solana:localnet".into())),
+            fee_payer: Arc::new(Mutex::new(None)),
         }
     }
 
     pub async fn set_verify_ok(&self, ok: bool) {
         *self.verify_ok.lock().await = ok;
     }
-
     pub async fn set_settle_ok(&self, ok: bool) {
         *self.settle_ok.lock().await = ok;
     }
-
     pub async fn set_verify_delay(&self, delay: Option<Duration>) {
         *self.verify_delay.lock().await = delay;
     }
-
     pub async fn set_settle_delay(&self, delay: Option<Duration>) {
         *self.settle_delay.lock().await = delay;
     }
-
     pub async fn set_ready(&self, ready: bool) {
         *self.ready.lock().await = ready;
     }
-
+    pub async fn set_network(&self, network: impl Into<String>) {
+        *self.network.lock().await = network.into();
+    }
+    pub async fn set_fee_payer(&self, fee_payer: Option<String>) {
+        *self.fee_payer.lock().await = fee_payer;
+    }
     pub async fn verify_calls(&self) -> u64 {
         *self.verify_calls.lock().await
     }
-
     pub async fn settle_calls(&self) -> u64 {
         *self.settle_calls.lock().await
     }
@@ -184,7 +228,7 @@ impl FacilitatorClient for MockFacilitatorClient {
                 success: true,
                 error_reason: None,
                 transaction: Some("mock-tx".into()),
-                network: Some("solana:localnet".into()),
+                network: Some(self.network.lock().await.clone()),
                 payer: Some("mock-payer".into()),
             })
         } else {
@@ -199,10 +243,13 @@ impl FacilitatorClient for MockFacilitatorClient {
     }
 
     async fn ready(&self) -> Result<(), PaymentError> {
-        if *self.ready.lock().await {
-            Ok(())
-        } else {
-            Err(PaymentError::Facilitator("not ready".into()))
+        if !*self.ready.lock().await {
+            return Err(PaymentError::Facilitator("not ready".into()));
         }
+        let _ = (
+            self.network.lock().await.clone(),
+            self.fee_payer.lock().await.clone(),
+        );
+        Ok(())
     }
 }

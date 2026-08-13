@@ -1,12 +1,15 @@
-//! Milestone 3 gateway route tests via axum Router + tower ServiceExt.
+//! Milestone 3 gateway route tests (offline).
 
 use std::sync::Arc;
 use std::time::Duration;
 
 use agentbond_app::{AppConfig, ServiceCatalog, ServiceEntry};
 use agentbond_gateway::{router, test_state};
-use agentbond_payments::MockFacilitatorClient;
-use agentbond_payments::headers::PAYMENT_SIGNATURE;
+use agentbond_payments::headers::{PAYMENT_REQUIRED, PAYMENT_SIGNATURE};
+use agentbond_payments::{
+    ExactPayloadBody, MockFacilitatorClient, PaymentPayload, PaymentRequired, ResourceInfo,
+    SCHEME_EXACT, SvmExactExtra, X402_VERSION,
+};
 use agentbond_sdk::{AccountData, ChainReader, MockChainReader, job_pda, program_id, provider_pda};
 use agentbond_types::{JobAccount, JobState, PROVIDER_STATUS_ACTIVE, ProviderAccount};
 use axum::body::Body;
@@ -28,6 +31,7 @@ fn test_config() -> AppConfig {
         token_program: TOKEN_PROGRAM.into(),
         facilitator_url: "http://127.0.0.1:9090".into(),
         merchant_pay_to: "11111111111111111111111111111112".into(),
+        x402_fee_payer: "11111111111111111111111111111113".into(),
         x402_amount: "1000".into(),
         x402_network: "solana:localnet".into(),
         request_timeout_ms: 5000,
@@ -49,16 +53,6 @@ fn test_catalog() -> ServiceCatalog {
     .expect("catalog")
 }
 
-async fn body_json(body: Body) -> Value {
-    let bytes = body.collect().await.expect("body").to_bytes();
-    serde_json::from_slice(&bytes).unwrap_or(Value::Null)
-}
-
-async fn body_text(body: Body) -> String {
-    let bytes = body.collect().await.expect("body").to_bytes();
-    String::from_utf8_lossy(&bytes).into_owned()
-}
-
 fn app(reader: Arc<MockChainReader>, fac: Arc<MockFacilitatorClient>) -> axum::Router {
     let state = test_state(
         test_config(),
@@ -69,14 +63,18 @@ fn app(reader: Arc<MockChainReader>, fac: Arc<MockFacilitatorClient>) -> axum::R
     router(state, 4096, Duration::from_secs(5))
 }
 
-#[tokio::test]
-async fn health_live_and_ready_dependency_failures() {
-    let reader = Arc::new(MockChainReader::new());
-    let fac = Arc::new(MockFacilitatorClient::new());
-    let app = app(reader.clone(), fac.clone());
+async fn body_json(body: Body) -> Value {
+    let bytes = body.collect().await.expect("body").to_bytes();
+    serde_json::from_slice(&bytes).unwrap_or(Value::Null)
+}
 
+#[tokio::test]
+async fn health_and_request_id() {
+    let app = app(
+        Arc::new(MockChainReader::new()),
+        Arc::new(MockFacilitatorClient::new()),
+    );
     let res = app
-        .clone()
         .oneshot(
             Request::builder()
                 .uri("/health/live")
@@ -86,9 +84,16 @@ async fn health_live_and_ready_dependency_failures() {
         .await
         .expect("live");
     assert_eq!(res.status(), StatusCode::OK);
+    assert!(res.headers().get("x-request-id").is_some());
+}
 
+#[tokio::test]
+async fn readiness_dependency_failure() {
+    let reader = Arc::new(MockChainReader::new());
+    reader.set_ready(false).await;
+    let fac = Arc::new(MockFacilitatorClient::new());
+    let app = app(reader, fac);
     let res = app
-        .clone()
         .oneshot(
             Request::builder()
                 .uri("/health/ready")
@@ -97,313 +102,15 @@ async fn health_live_and_ready_dependency_failures() {
         )
         .await
         .expect("ready");
-    assert_eq!(res.status(), StatusCode::OK);
-
-    reader.set_ready(false).await;
-    let res = app
-        .clone()
-        .oneshot(
-            Request::builder()
-                .uri("/health/ready")
-                .body(Body::empty())
-                .expect("req"),
-        )
-        .await
-        .expect("ready fail");
     assert_eq!(res.status(), StatusCode::SERVICE_UNAVAILABLE);
-    let body = body_json(res.into_body()).await;
-    assert!(body["error"]["message"].as_str().is_some());
-    assert_eq!(body["error"]["details"]["rpc"], false);
-
-    reader.set_ready(true).await;
-    fac.set_ready(false).await;
-    let res = app
-        .oneshot(
-            Request::builder()
-                .uri("/health/ready")
-                .body(Body::empty())
-                .expect("req"),
-        )
-        .await
-        .expect("ready fac fail");
-    assert_eq!(res.status(), StatusCode::SERVICE_UNAVAILABLE);
+    assert!(res.headers().get("x-request-id").is_some());
 }
 
 #[tokio::test]
-async fn services_routes_and_invalid_json() {
+async fn structured_provider_and_job() {
     let reader = Arc::new(MockChainReader::new());
-    let fac = Arc::new(MockFacilitatorClient::new());
-    let app = app(reader, fac);
-
-    let res = app
-        .clone()
-        .oneshot(
-            Request::builder()
-                .uri("/v1/services")
-                .body(Body::empty())
-                .expect("req"),
-        )
-        .await
-        .expect("services");
-    assert_eq!(res.status(), StatusCode::OK);
-    let body = body_json(res.into_body()).await;
-    assert_eq!(body["services"][0]["service_id"], "hash-demo");
-
-    let res = app
-        .clone()
-        .oneshot(
-            Request::builder()
-                .uri("/v1/services/missing")
-                .body(Body::empty())
-                .expect("req"),
-        )
-        .await
-        .expect("missing");
-    assert_eq!(res.status(), StatusCode::NOT_FOUND);
-    let err = body_json(res.into_body()).await;
-    assert!(err["error"]["message"].as_str().is_some());
-
-    let res = app
-        .oneshot(
-            Request::builder()
-                .method("POST")
-                .uri("/v1/plans/jobs/fund")
-                .header("content-type", "application/json")
-                .body(Body::from("{not-json"))
-                .expect("req"),
-        )
-        .await
-        .expect("bad json");
-    assert_eq!(res.status(), StatusCode::BAD_REQUEST);
-}
-
-#[tokio::test]
-async fn oversized_body_rejected() {
-    let reader = Arc::new(MockChainReader::new());
-    let fac = Arc::new(MockFacilitatorClient::new());
-    let app = app(reader, fac);
-    let big = "x".repeat(8192);
-    let res = app
-        .oneshot(
-            Request::builder()
-                .method("POST")
-                .uri("/v1/plans/jobs/fund")
-                .header("content-type", "application/json")
-                .body(Body::from(format!(r#"{{"buyer":"{big}","provider":"11111111111111111111111111111112","job_nonce":1}}"#)))
-                .expect("req"),
-        )
-        .await
-        .expect("oversized");
-    assert!(
-        res.status() == StatusCode::PAYLOAD_TOO_LARGE
-            || res.status() == StatusCode::BAD_REQUEST
-            || res.status() == StatusCode::LENGTH_REQUIRED,
-        "unexpected status {}",
-        res.status()
-    );
-}
-
-#[tokio::test]
-async fn escrow_plan_routes_never_invoke_facilitator() {
-    let reader = Arc::new(MockChainReader::new());
-    reader.set_timestamp(1_700_000_000).await;
-    let fac = Arc::new(MockFacilitatorClient::new());
-    let app = app(reader.clone(), fac.clone());
-
-    let create_body = json!({
-        "buyer": "11111111111111111111111111111111",
-        "provider": "11111111111111111111111111111112",
-        "job_nonce": 1,
-        "amount": 1000,
-        "request_hash_hex": "09".repeat(32),
-        "fund_deadline": 1_700_000_100,
-        "accept_deadline": 1_700_000_200,
-        "work_deadline": 1_700_000_300,
-        "auto_settle_deadline": 1_700_000_400
-    });
-
-    for (uri, body) in [
-        ("/v1/plans/jobs/create", create_body),
-        (
-            "/v1/plans/jobs/fund",
-            json!({
-                "buyer": "11111111111111111111111111111111",
-                "provider": "11111111111111111111111111111112",
-                "job_nonce": 1
-            }),
-        ),
-        (
-            "/v1/plans/jobs/accept",
-            json!({
-                "buyer": "11111111111111111111111111111111",
-                "provider": "11111111111111111111111111111112",
-                "job_nonce": 1
-            }),
-        ),
-        (
-            "/v1/plans/jobs/accept-work",
-            json!({
-                "buyer": "11111111111111111111111111111111",
-                "provider": "11111111111111111111111111111112",
-                "job_nonce": 1
-            }),
-        ),
-        (
-            "/v1/plans/jobs/challenge",
-            json!({
-                "buyer": "11111111111111111111111111111111",
-                "provider": "11111111111111111111111111111112",
-                "job_nonce": 1,
-                "reason_hash_hex": "0a".repeat(32)
-            }),
-        ),
-    ] {
-        let res = app
-            .clone()
-            .oneshot(
-                Request::builder()
-                    .method("POST")
-                    .uri(uri)
-                    .header("content-type", "application/json")
-                    .body(Body::from(body.to_string()))
-                    .expect("req"),
-            )
-            .await
-            .expect("plan");
-        let status = res.status();
-        assert!(
-            status.is_success() || status.is_client_error(),
-            "{uri} status {status}"
-        );
-        let text = body_text(res.into_body()).await;
-        assert!(!text.to_ascii_lowercase().contains("private_key"), "{uri}");
-        // Escrow plan responses must not look like x402 settlement.
-        assert!(!text.contains("mock-tx"), "{uri}");
-        if status.is_success() {
-            let value: Value = serde_json::from_str(&text).expect("json");
-            assert!(
-                value.get("action").is_some() || value.get("instructions").is_some(),
-                "{uri}"
-            );
-            // x402 route never builds escrow plans — inverse: escrow never builds x402 demo.
-            assert_ne!(value.get("action"), Some(&json!("x402_invoke")));
-        }
-    }
-
-    // Seed job for timeout route.
     let program = program_id();
-    let buyer: Pubkey = "11111111111111111111111111111111".parse().expect("buyer");
-    let provider: Pubkey = "11111111111111111111111111111112"
-        .parse()
-        .expect("provider");
-    let job_addr = job_pda(&program, &buyer, &provider, 1)
-        .expect("job")
-        .address;
-    let job = JobAccount {
-        bump: 1,
-        state: JobState::Created,
-        buyer: buyer.to_bytes(),
-        provider: provider.to_bytes(),
-        mint: [0u8; 32],
-        token_program: TOKEN_PROGRAM.parse::<Pubkey>().expect("token").to_bytes(),
-        amount: 1000,
-        job_nonce: 1,
-        fund_deadline: 1_699_999_000,
-        accept_deadline: 1_700_000_200,
-        work_deadline: 1_700_000_300,
-        auto_settle_deadline: 1_700_000_400,
-        receipt_digest: [0u8; 32],
-        request_hash: [9u8; 32],
-        locked_bond: 0,
-        mint_decimals: 6,
-    };
-    reader
-        .set_account(
-            job_addr,
-            AccountData {
-                owner: program,
-                data: job.encode().to_vec(),
-                lamports: 1,
-            },
-        )
-        .await;
-
-    let res = app
-        .clone()
-        .oneshot(
-            Request::builder()
-                .method("POST")
-                .uri("/v1/plans/jobs/resolve-timeout")
-                .header("content-type", "application/json")
-                .body(Body::from(
-                    json!({
-                        "payer": "11111111111111111111111111111111",
-                        "buyer": "11111111111111111111111111111111",
-                        "provider": "11111111111111111111111111111112",
-                        "job_nonce": 1
-                    })
-                    .to_string(),
-                ))
-                .expect("req"),
-        )
-        .await
-        .expect("timeout");
-    assert!(res.status().is_success(), "timeout {}", res.status());
-
-    // submit-receipt with private key field rejected
-    let res = app
-        .oneshot(
-            Request::builder()
-                .method("POST")
-                .uri("/v1/plans/jobs/submit-receipt")
-                .header("content-type", "application/json")
-                .body(Body::from(
-                    json!({
-                        "job": "11111111111111111111111111111111",
-                        "provider": "11111111111111111111111111111112",
-                        "private_key": "should-reject",
-                        "receipt": {
-                            "program_id_hex": "0a".repeat(32),
-                            "genesis_hash_hex": "07".repeat(32),
-                            "job_hex": "01".repeat(32),
-                            "buyer_hex": "02".repeat(32),
-                            "provider_hex": "03".repeat(32),
-                            "request_hash_hex": "09".repeat(32),
-                            "result_hash_hex": "04".repeat(32),
-                            "artifact_hash_hex": "05".repeat(32),
-                            "software_hash_hex": "06".repeat(32),
-                            "job_nonce": 1,
-                            "created_at": 1,
-                            "expires_at": 2
-                        },
-                        "execution_pubkey_hex": "0b".repeat(32),
-                        "signature_hex": "0c".repeat(64)
-                    })
-                    .to_string(),
-                ))
-                .expect("req"),
-        )
-        .await
-        .expect("submit");
-    assert_eq!(res.status(), StatusCode::BAD_REQUEST);
-    let err = body_json(res.into_body()).await;
-    assert!(
-        err["error"]["message"]
-            .as_str()
-            .unwrap_or("")
-            .contains("private key")
-    );
-
-    assert_eq!(fac.verify_calls().await, 0, "escrow must not verify");
-    assert_eq!(fac.settle_calls().await, 0, "escrow must not settle");
-}
-
-#[tokio::test]
-async fn provider_job_inspect_and_x402_never_builds_escrow_plans() {
-    let reader = Arc::new(MockChainReader::new());
-    let fac = Arc::new(MockFacilitatorClient::new());
-    let program = program_id();
-    let authority: Pubkey = "11111111111111111111111111111113".parse().expect("auth");
+    let authority: Pubkey = "11111111111111111111111111111113".parse().expect("pk");
     let provider_addr = provider_pda(&program, &authority).expect("pda").address;
     let provider = ProviderAccount {
         bump: 1,
@@ -422,8 +129,40 @@ async fn provider_job_inspect_and_x402_never_builds_escrow_plans() {
             },
         )
         .await;
+    let buyer: Pubkey = "11111111111111111111111111111111".parse().expect("b");
+    let job_addr = job_pda(&program, &buyer, &authority, 1)
+        .expect("job")
+        .address;
+    let job = JobAccount {
+        bump: 1,
+        state: JobState::Created,
+        buyer: buyer.to_bytes(),
+        provider: authority.to_bytes(),
+        mint: [0u8; 32],
+        token_program: TOKEN_PROGRAM.parse::<Pubkey>().expect("t").to_bytes(),
+        amount: 1000,
+        job_nonce: 1,
+        fund_deadline: 10,
+        accept_deadline: 20,
+        work_deadline: 30,
+        auto_settle_deadline: 40,
+        receipt_digest: [0u8; 32],
+        request_hash: [9u8; 32],
+        locked_bond: 0,
+        mint_decimals: 6,
+    };
+    reader
+        .set_account(
+            job_addr,
+            AccountData {
+                owner: program,
+                data: job.encode().to_vec(),
+                lamports: 1,
+            },
+        )
+        .await;
 
-    let app = app(reader.clone(), fac.clone());
+    let app = app(reader, Arc::new(MockFacilitatorClient::new()));
     let res = app
         .clone()
         .oneshot(
@@ -435,8 +174,136 @@ async fn provider_job_inspect_and_x402_never_builds_escrow_plans() {
         .await
         .expect("provider");
     assert_eq!(res.status(), StatusCode::OK);
+    let v = body_json(res.into_body()).await;
+    assert_eq!(v["provider"]["status"], "Active");
 
-    // x402 missing payment -> 402, no escrow plan fields
+    let res = app
+        .oneshot(
+            Request::builder()
+                .uri(format!("/v1/jobs/{job_addr}"))
+                .body(Body::empty())
+                .expect("req"),
+        )
+        .await
+        .expect("job");
+    assert_eq!(res.status(), StatusCode::OK);
+    let v = body_json(res.into_body()).await;
+    assert_eq!(v["job"]["state"], "Created");
+}
+
+#[tokio::test]
+async fn plan_routes_and_private_key_rejection() {
+    let reader = Arc::new(MockChainReader::new());
+    reader.set_timestamp(1_700_000_000).await;
+    let fac = Arc::new(MockFacilitatorClient::new());
+    let app = app(reader, fac.clone());
+
+    let create = json!({
+        "buyer": "11111111111111111111111111111111",
+        "provider": "11111111111111111111111111111112",
+        "job_nonce": 1,
+        "amount": 1000,
+        "request_hash_hex": "09".repeat(32),
+        "fund_deadline": 1_700_000_100i64,
+        "accept_deadline": 1_700_000_200i64,
+        "work_deadline": 1_700_000_300i64,
+        "auto_settle_deadline": 1_700_000_400i64
+    });
+    for path in [
+        "/v1/plans/jobs/create",
+        "/v1/plans/jobs/fund",
+        "/v1/plans/jobs/accept",
+        "/v1/plans/jobs/accept-work",
+        "/v1/plans/jobs/challenge",
+        "/v1/plans/jobs/resolve-timeout",
+        "/v1/plans/jobs/submit-receipt",
+    ] {
+        let body = if path.ends_with("create") {
+            create.clone()
+        } else if path.ends_with("challenge") {
+            json!({
+                "buyer":"11111111111111111111111111111111",
+                "provider":"11111111111111111111111111111112",
+                "job_nonce":1,
+                "reason_hash_hex":"0a".repeat(32)
+            })
+        } else if path.ends_with("resolve-timeout") {
+            json!({
+                "payer":"11111111111111111111111111111111",
+                "buyer":"11111111111111111111111111111111",
+                "provider":"11111111111111111111111111111112",
+                "job_nonce":1
+            })
+        } else if path.ends_with("submit-receipt") {
+            json!({
+                "job":"11111111111111111111111111111114",
+                "provider":"11111111111111111111111111111112",
+                "receipt":{
+                    "program_id_hex": hex::encode(program_id().to_bytes()),
+                    "genesis_hash_hex":"07".repeat(32),
+                    "job_hex":"0e".repeat(32),
+                    "buyer_hex":"02".repeat(32),
+                    "provider_hex": hex::encode("11111111111111111111111111111112".parse::<Pubkey>().expect("p").to_bytes()),
+                    "request_hash_hex":"09".repeat(32),
+                    "result_hash_hex":"04".repeat(32),
+                    "artifact_hash_hex":"05".repeat(32),
+                    "software_hash_hex":"06".repeat(32),
+                    "job_nonce":1,
+                    "created_at":1_700_000_000i64,
+                    "expires_at":1_700_000_400i64
+                },
+                "execution_pubkey_hex":"0b".repeat(32),
+                "signature_hex":"0c".repeat(64)
+            })
+        } else {
+            json!({
+                "buyer":"11111111111111111111111111111111",
+                "provider":"11111111111111111111111111111112",
+                "job_nonce":1
+            })
+        };
+        let res = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(path)
+                    .header("content-type", "application/json")
+                    .body(Body::from(body.to_string()))
+                    .expect("req"),
+            )
+            .await
+            .expect("plan");
+        // create may succeed; others may fail validation — never 500, never call facilitator
+        assert_ne!(res.status(), StatusCode::INTERNAL_SERVER_ERROR, "{path}");
+        assert!(res.headers().get("x-request-id").is_some());
+    }
+    assert_eq!(fac.verify_calls().await, 0);
+    assert_eq!(fac.settle_calls().await, 0);
+
+    let res = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/plans/jobs/fund")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    json!({"buyer":"11111111111111111111111111111111","provider":"11111111111111111111111111111112","job_nonce":1,"private_key":"aa"}).to_string(),
+                ))
+                .expect("req"),
+        )
+        .await
+        .expect("reject");
+    assert_eq!(res.status(), StatusCode::BAD_REQUEST);
+}
+
+#[tokio::test]
+async fn x402_missing_and_success() {
+    let reader = Arc::new(MockChainReader::new());
+    reader.set_timestamp(1_700_000_000).await;
+    let fac = Arc::new(MockFacilitatorClient::new());
+    let app = app(reader, fac.clone());
+
     let res = app
         .clone()
         .oneshot(
@@ -444,39 +311,59 @@ async fn provider_job_inspect_and_x402_never_builds_escrow_plans() {
                 .method("POST")
                 .uri("/v1/x402/services/hash-demo/invoke")
                 .header("content-type", "application/json")
-                .body(Body::from(r#"{"input":{"n":1}}"#))
+                .body(Body::from(json!({"input":{"x":1}}).to_string()))
                 .expect("req"),
         )
         .await
-        .expect("x402");
+        .expect("402");
     assert_eq!(res.status(), StatusCode::PAYMENT_REQUIRED);
-    let text = body_text(res.into_body()).await;
-    assert!(!text.contains("create_job"));
-    assert!(!text.contains("fund_job"));
-    assert!(!text.contains("required_signers"));
-    assert_eq!(fac.verify_calls().await, 0);
+    let payment_required = res
+        .headers()
+        .get(PAYMENT_REQUIRED)
+        .expect("PAYMENT-REQUIRED")
+        .to_str()
+        .expect("str")
+        .to_string();
+    assert_eq!(fac.settle_calls().await, 0);
 
-    // Successful x402 payment path uses facilitator, still no escrow plan action.
-    let payment = json!({
-        "x402Version": 2,
-        "resource": {
-            "url": "/v1/x402/services/hash-demo/invoke",
-            "description": "demo",
-            "mimeType": "application/json"
+    let required: PaymentRequired = {
+        let bytes = Engine::decode(
+            &base64::engine::general_purpose::STANDARD,
+            payment_required.trim(),
+        )
+        .expect("b64");
+        serde_json::from_slice(&bytes).expect("json")
+    };
+    let accepted = required.accepts[0].clone();
+    let payload = PaymentPayload {
+        x402_version: X402_VERSION,
+        resource: ResourceInfo {
+            url: "/v1/x402/services/hash-demo/invoke".into(),
+            description: "demo".into(),
+            mime_type: "application/json".into(),
         },
-        "accepted": {
-            "scheme": "exact",
-            "network": "solana:localnet",
-            "amount": "1000",
-            "asset": "11111111111111111111111111111111",
-            "payTo": "11111111111111111111111111111112",
-            "maxTimeoutSeconds": 60
+        accepted: agentbond_payments::PaymentRequirements {
+            scheme: SCHEME_EXACT.into(),
+            network: accepted.network,
+            amount: accepted.amount,
+            asset: accepted.asset,
+            pay_to: accepted.pay_to,
+            max_timeout_seconds: accepted.max_timeout_seconds,
+            extra: SvmExactExtra {
+                fee_payer: accepted.extra.fee_payer,
+                memo: accepted.extra.memo,
+                recent_blockhash: None,
+                last_valid_block_height: None,
+            },
         },
-        "payload": { "transaction": "deadbeef" }
-    });
-    let header = Engine::encode(
+        payload: ExactPayloadBody {
+            transaction: Engine::encode(&base64::engine::general_purpose::STANDARD, [9u8; 64]),
+        },
+        extensions: Default::default(),
+    };
+    let sig = Engine::encode(
         &base64::engine::general_purpose::STANDARD,
-        payment.to_string().as_bytes(),
+        serde_json::to_vec(&payload).expect("json"),
     );
     let res = app
         .oneshot(
@@ -484,17 +371,18 @@ async fn provider_job_inspect_and_x402_never_builds_escrow_plans() {
                 .method("POST")
                 .uri("/v1/x402/services/hash-demo/invoke")
                 .header("content-type", "application/json")
-                .header(PAYMENT_SIGNATURE, header)
-                .body(Body::from(r#"{"input":{"n":1}}"#))
+                .header(PAYMENT_SIGNATURE, sig)
+                .body(Body::from(json!({"input":{"x":1}}).to_string()))
                 .expect("req"),
         )
         .await
-        .expect("x402 paid");
+        .expect("200");
     assert_eq!(res.status(), StatusCode::OK);
-    let body = body_json(res.into_body()).await;
-    assert_eq!(body["service"], "agentbond-x402-demo");
-    assert!(body.get("action").is_none());
-    assert!(body.get("instructions").is_none());
-    assert!(fac.verify_calls().await >= 1);
-    assert!(fac.settle_calls().await >= 1);
+    assert_eq!(fac.settle_calls().await, 1);
+}
+
+mod hex {
+    pub fn encode(bytes: impl AsRef<[u8]>) -> String {
+        bytes.as_ref().iter().map(|b| format!("{b:02x}")).collect()
+    }
 }

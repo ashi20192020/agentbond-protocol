@@ -4,6 +4,8 @@ use std::collections::BTreeMap;
 
 pub const X402_VERSION: u32 = 2;
 pub const SCHEME_EXACT: &str = "exact";
+/// Solana legacy transaction serialized size upper bound.
+pub const MAX_SOLANA_TX_BYTES: usize = 1232;
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
@@ -11,6 +13,18 @@ pub struct ResourceInfo {
     pub url: String,
     pub description: String,
     pub mime_type: String,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct SvmExactExtra {
+    pub fee_payer: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub memo: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub recent_blockhash: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_valid_block_height: Option<u64>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
@@ -22,8 +36,7 @@ pub struct PaymentRequirements {
     pub asset: String,
     pub pay_to: String,
     pub max_timeout_seconds: u64,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub extra: Option<BTreeMap<String, Value>>,
+    pub extra: SvmExactExtra,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
@@ -38,11 +51,17 @@ pub struct PaymentRequired {
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "camelCase")]
+pub struct ExactPayloadBody {
+    pub transaction: String,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
 pub struct PaymentPayload {
     pub x402_version: u32,
     pub resource: ResourceInfo,
     pub accepted: PaymentRequirements,
-    pub payload: BTreeMap<String, Value>,
+    pub payload: ExactPayloadBody,
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub extensions: BTreeMap<String, Value>,
 }
@@ -85,4 +104,19 @@ pub struct SettleResponse {
     pub network: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub payer: Option<String>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct SupportedKind {
+    pub scheme: String,
+    pub network: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fee_payer: Option<String>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct SupportedResponse {
+    pub kinds: Vec<SupportedKind>,
 }

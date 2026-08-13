@@ -18,12 +18,31 @@ pub struct PlannedInstruction {
     pub data_base64: String,
 }
 
+/// Transport-neutral unsigned plan. Mint/amount are public summary fields only.
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub struct InstructionPlan {
     pub action: String,
     pub program_id: String,
     pub instructions: Vec<PlannedInstruction>,
     pub required_signers: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expires_at: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mint: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub amount: Option<u64>,
+}
+
+/// Safe public summary for CLI/gateway display (no secrets).
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct PlanSummary {
+    pub action: String,
+    pub program_id: String,
+    pub required_signers: Vec<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub mint: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub amount: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub expires_at: Option<i64>,
 }
@@ -48,6 +67,25 @@ impl InstructionPlan {
                 .map(|p| p.to_string())
                 .collect(),
             expires_at,
+            mint: None,
+            amount: None,
+        }
+    }
+
+    pub fn with_mint_amount(mut self, mint: &Pubkey, amount: u64) -> Self {
+        self.mint = Some(mint.to_string());
+        self.amount = Some(amount);
+        self
+    }
+
+    pub fn summary(&self) -> PlanSummary {
+        PlanSummary {
+            action: self.action.clone(),
+            program_id: self.program_id.clone(),
+            required_signers: self.required_signers.clone(),
+            mint: self.mint.clone(),
+            amount: self.amount,
+            expires_at: self.expires_at,
         }
     }
 

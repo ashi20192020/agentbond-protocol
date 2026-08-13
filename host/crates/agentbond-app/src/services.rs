@@ -1,17 +1,19 @@
 use agentbond_sdk::{
-    ChainReader, InstructionPlan, build_submit_receipt_plan, decode_job, decode_provider,
-    plan_accept_job, plan_accept_work, plan_challenge_work, plan_create_job,
-    plan_expire_unaccepted, plan_expire_unfunded, plan_fund_job, plan_resolve_timeout_refund,
+    ChainReader, InstructionPlan, build_submit_receipt_plan_at, challenge_pda, decode_challenge,
+    decode_job, decode_provider, plan_accept_job, plan_accept_work, plan_challenge_work,
+    plan_create_job, plan_expire_unfunded, plan_fund_job, plan_resolve_timeout_refund,
     plan_resolve_timeout_settle,
 };
 use agentbond_types::{CreateJobPayload, JobState};
 use serde::{Deserialize, Serialize};
 use solana_pubkey::Pubkey;
 
+use crate::accounts::{ChallengeDto, ConfigDto, JobDto, ProviderBondDto, ProviderDto};
 use crate::catalog::ServiceCatalog;
 use crate::config::AppConfig;
 use crate::error::AppError;
 use crate::receipt_dto::ReceiptDto;
+use agentbond_sdk::{config_pda, decode_config, decode_provider_bond};
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct CreateJobRequest {
@@ -122,6 +124,71 @@ pub fn get_service<'a>(
     catalog.get(service_id)
 }
 
+pub async fn inspect_config_dto(
+    reader: &dyn ChainReader,
+    program_id: &Pubkey,
+) -> Result<ConfigDto, AppError> {
+    let addr = config_pda(program_id)?.address;
+    let acc = reader
+        .get_account(&addr)
+        .await?
+        .ok_or_else(|| AppError::NotFound("config".into()))?;
+    let cfg = decode_config(program_id, &addr, &acc.owner, &acc.data)?;
+    Ok(ConfigDto::from_account(&cfg))
+}
+
+pub async fn inspect_provider_dto(
+    reader: &dyn ChainReader,
+    program_id: &Pubkey,
+    address: &Pubkey,
+) -> Result<ProviderDto, AppError> {
+    let acc = reader
+        .get_account(address)
+        .await?
+        .ok_or_else(|| AppError::NotFound("provider".into()))?;
+    let account = decode_provider(program_id, address, &acc.owner, &acc.data)?;
+    Ok(ProviderDto::from_account(&account))
+}
+
+pub async fn inspect_bond_dto(
+    reader: &dyn ChainReader,
+    program_id: &Pubkey,
+    address: &Pubkey,
+) -> Result<ProviderBondDto, AppError> {
+    let acc = reader
+        .get_account(address)
+        .await?
+        .ok_or_else(|| AppError::NotFound("bond".into()))?;
+    let account = decode_provider_bond(program_id, address, &acc.owner, &acc.data)?;
+    Ok(ProviderBondDto::from_account(&account))
+}
+
+pub async fn inspect_job_dto(
+    reader: &dyn ChainReader,
+    program_id: &Pubkey,
+    address: &Pubkey,
+) -> Result<JobDto, AppError> {
+    let acc = reader
+        .get_account(address)
+        .await?
+        .ok_or_else(|| AppError::NotFound("job".into()))?;
+    let account = decode_job(program_id, address, &acc.owner, &acc.data)?;
+    Ok(JobDto::from_account(&account))
+}
+
+pub async fn inspect_challenge_dto(
+    reader: &dyn ChainReader,
+    program_id: &Pubkey,
+    address: &Pubkey,
+) -> Result<ChallengeDto, AppError> {
+    let acc = reader
+        .get_account(address)
+        .await?
+        .ok_or_else(|| AppError::NotFound("challenge".into()))?;
+    let account = decode_challenge(program_id, address, &acc.owner, &acc.data)?;
+    Ok(ChallengeDto::from_account(&account))
+}
+
 pub async fn inspect_provider(
     reader: &dyn ChainReader,
     program_id: &Pubkey,
@@ -165,13 +232,11 @@ pub async fn build_create_job_plan(
         work_deadline: req.work_deadline,
         auto_settle_deadline: req.auto_settle_deadline,
     };
-    Ok(plan_create_job(
-        &program_id,
-        &buyer,
-        &provider,
-        now,
-        &payload,
-    )?)
+    let mint = cfg.mint_pubkey()?;
+    Ok(
+        plan_create_job(&program_id, &buyer, &provider, now, &payload)?
+            .with_mint_amount(&mint, req.amount),
+    )
 }
 
 pub fn build_fund_job_plan(
@@ -204,8 +269,9 @@ pub fn build_accept_job_plan(
     )?)
 }
 
-pub fn build_submit_receipt_plan_uc(
+pub async fn build_submit_receipt_plan_uc(
     cfg: &AppConfig,
+    reader: &dyn ChainReader,
     req: &SubmitReceiptRequest,
 ) -> Result<InstructionPlan, AppError> {
     let program_id = cfg.program_pubkey()?;
@@ -214,13 +280,15 @@ pub fn build_submit_receipt_plan_uc(
     let pubkey = hex32(&req.execution_pubkey_hex, "execution_pubkey")?;
     let signature = hex64(&req.signature_hex, "signature")?;
     let receipt = req.receipt.to_receipt()?;
-    Ok(build_submit_receipt_plan(
+    let now = reader.get_unix_timestamp().await?;
+    Ok(build_submit_receipt_plan_at(
         &program_id,
         &job,
         &provider,
         &receipt,
         &pubkey,
         &signature,
+        Some(now),
     )?)
 }
 
@@ -261,6 +329,7 @@ pub async fn build_timeout_plan(
 ) -> Result<InstructionPlan, AppError> {
     let program_id = cfg.program_pubkey()?;
     let mint = cfg.mint_pubkey()?;
+    let token_program = pk(&cfg.token_program, "token_program")?;
     let buyer = pk(&req.buyer, "buyer")?;
     let provider = pk(&req.provider, "provider")?;
     let payer = pk(&req.payer, "payer")?;
@@ -268,24 +337,30 @@ pub async fn build_timeout_plan(
     let job = inspect_job(reader, &program_id, &job_addr).await?;
     let now = reader.get_unix_timestamp().await?;
 
+    if job.buyer != buyer.to_bytes()
+        || job.provider != provider.to_bytes()
+        || job.job_nonce != req.job_nonce
+        || job.mint != mint.to_bytes()
+        || job.token_program != token_program.to_bytes()
+    {
+        return Err(AppError::Validation(
+            "fetched job does not match request and configured protocol".into(),
+        ));
+    }
+
+    if job.state.is_terminal() {
+        return Err(AppError::Validation(
+            "terminal job is never eligible for timeout resolution".into(),
+        ));
+    }
+
     match job.state {
-        JobState::Submitted if now >= job.auto_settle_deadline => Ok(plan_resolve_timeout_settle(
+        JobState::Created if now >= job.fund_deadline => Ok(plan_expire_unfunded(
             &program_id,
             &payer,
             &buyer,
             &provider,
-            &mint,
             req.job_nonce,
-            false,
-        )?),
-        JobState::Challenged => Ok(plan_resolve_timeout_settle(
-            &program_id,
-            &payer,
-            &buyer,
-            &provider,
-            &mint,
-            req.job_nonce,
-            true,
         )?),
         JobState::Funded if now >= job.accept_deadline => Ok(plan_resolve_timeout_refund(
             &program_id,
@@ -303,21 +378,42 @@ pub async fn build_timeout_plan(
             &mint,
             req.job_nonce,
         )?),
-        JobState::Created if now >= job.fund_deadline => Ok(plan_expire_unfunded(
-            &program_id,
-            &payer,
-            &buyer,
-            &provider,
-            req.job_nonce,
-        )?),
-        JobState::Funded => Ok(plan_expire_unaccepted(
+        JobState::Submitted if now >= job.auto_settle_deadline => Ok(plan_resolve_timeout_settle(
             &program_id,
             &payer,
             &buyer,
             &provider,
             &mint,
             req.job_nonce,
+            false,
         )?),
+        JobState::Challenged => {
+            let challenge_addr = challenge_pda(&program_id, &job_addr)?.address;
+            let acc = reader
+                .get_account(&challenge_addr)
+                .await?
+                .ok_or_else(|| AppError::NotFound("challenge".into()))?;
+            let challenge = decode_challenge(&program_id, &challenge_addr, &acc.owner, &acc.data)?;
+            if challenge.job != job_addr.to_bytes() {
+                return Err(AppError::Validation(
+                    "challenge does not belong to job".into(),
+                ));
+            }
+            if now < challenge.deadline {
+                return Err(AppError::Validation(
+                    "challenge deadline not reached".into(),
+                ));
+            }
+            Ok(plan_resolve_timeout_settle(
+                &program_id,
+                &payer,
+                &buyer,
+                &provider,
+                &mint,
+                req.job_nonce,
+                true,
+            )?)
+        }
         _ => Err(AppError::Validation(
             "job is not eligible for timeout resolution".into(),
         )),

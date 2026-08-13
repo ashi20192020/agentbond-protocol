@@ -22,10 +22,22 @@ pub enum PaymentError {
     WrongAmount,
     #[error("wrong recipient")]
     WrongRecipient,
+    #[error("wrong fee payer")]
+    WrongFeePayer,
     #[error("expired requirements")]
     Expired,
     #[error("unsupported extension")]
     UnsupportedExtension,
+    #[error("invalid challenge")]
+    InvalidChallenge,
+    #[error("challenge expired")]
+    ChallengeExpired,
+    #[error("invalid transaction")]
+    InvalidTransaction,
+    #[error("settlement in progress; retry later")]
+    SettlementInProgress,
+    #[error("transaction binding mismatch")]
+    BindingMismatch,
     #[error("verify rejected")]
     VerifyRejected,
     #[error("verify timeout")]

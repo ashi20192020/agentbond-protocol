@@ -45,7 +45,6 @@ pub fn encode_payment_response_header(value: &SettleResponse) -> Result<String, 
     encode_b64_json(value)
 }
 
-/// Headers that must never appear in logs.
 pub fn is_sensitive_header(name: &str) -> bool {
     let lower = name.to_ascii_lowercase();
     matches!(

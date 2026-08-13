@@ -10,15 +10,17 @@ use agentbond_app::{
     AcceptJobRequest, AcceptWorkRequest, ChallengeRequest, CreateJobRequest, FundJobRequest,
     SubmitReceiptRequest, TimeoutRequest, build_accept_job_plan, build_accept_work_plan,
     build_challenge_plan, build_create_job_plan, build_fund_job_plan, build_submit_receipt_plan_uc,
-    build_timeout_plan, get_service, inspect_job, inspect_provider, list_services,
+    build_timeout_plan, get_service, inspect_job_dto, inspect_provider_dto, list_services,
 };
 use agentbond_payments::headers::{
     PAYMENT_REQUIRED, PAYMENT_RESPONSE, PAYMENT_SIGNATURE, is_sensitive_header,
 };
-use agentbond_payments::{PaymentCache, X402ResourceConfig, invoke_paid_demo};
-use agentbond_sdk::parse_pubkey;
+use agentbond_payments::{X402ResourceConfig, invoke_paid_demo};
+use agentbond_sdk::{ChainReader, parse_pubkey};
 use axum::extract::{Path, State};
-use axum::http::{HeaderMap, StatusCode};
+use axum::http::{HeaderMap, HeaderValue, Request, StatusCode};
+use axum::middleware::{self, Next};
+use axum::response::Response;
 use axum::routing::{get, post};
 use axum::{Json, Router};
 use serde::Deserialize;
@@ -29,8 +31,27 @@ use tower_http::trace::TraceLayer;
 use uuid::Uuid;
 
 use crate::error::{ApiError, ApiResult};
-
 pub use state::AppState;
+
+/// Test helper: build AppState with mock stores.
+pub fn test_state(
+    cfg: agentbond_app::AppConfig,
+    catalog: agentbond_app::ServiceCatalog,
+    reader: Arc<dyn ChainReader>,
+    facilitator: Arc<dyn agentbond_payments::FacilitatorClient>,
+) -> AppState {
+    AppState {
+        cfg: Arc::new(cfg),
+        catalog: Arc::new(catalog),
+        reader,
+        facilitator,
+        challenges: Arc::new(agentbond_payments::ChallengeStore::new()),
+        settlements: Arc::new(agentbond_payments::SettlementStore::new()),
+    }
+}
+
+#[derive(Clone)]
+struct RequestId(String);
 
 pub fn router(state: AppState, max_body: usize, timeout: Duration) -> Router {
     Router::new()
@@ -48,6 +69,7 @@ pub fn router(state: AppState, max_body: usize, timeout: Duration) -> Router {
         .route("/v1/plans/jobs/challenge", post(plan_challenge))
         .route("/v1/plans/jobs/resolve-timeout", post(plan_timeout))
         .route("/v1/x402/services/{service_id}/invoke", post(x402_invoke))
+        .layer(middleware::from_fn(attach_request_id))
         .layer(RequestBodyLimitLayer::new(max_body))
         .layer(TimeoutLayer::with_status_code(
             StatusCode::REQUEST_TIMEOUT,
@@ -55,19 +77,40 @@ pub fn router(state: AppState, max_body: usize, timeout: Duration) -> Router {
         ))
         .layer(
             TraceLayer::new_for_http().make_span_with(|req: &axum::http::Request<_>| {
-                let id = Uuid::new_v4();
+                let id = req
+                    .extensions()
+                    .get::<RequestId>()
+                    .map(|r| r.0.clone())
+                    .unwrap_or_else(|| "unknown".into());
                 let mut headers = String::new();
                 for (k, _) in req.headers() {
                     if is_sensitive_header(k.as_str()) {
                         headers.push_str(k.as_str());
-                        headers.push('=');
-                        headers.push_str("<redacted>;");
+                        headers.push_str("=<redacted>;");
                     }
                 }
                 tracing::info_span!("request", request_id = %id, sensitive = %headers)
             }),
         )
         .with_state(state)
+}
+
+async fn attach_request_id(mut req: Request<axum::body::Body>, next: Next) -> Response {
+    let id = Uuid::new_v4().to_string();
+    req.extensions_mut().insert(RequestId(id.clone()));
+    let mut response = next.run(req).await;
+    if let Ok(v) = HeaderValue::from_str(&id) {
+        response.headers_mut().insert("x-request-id", v);
+    }
+    response
+}
+
+fn request_id_from(headers: &HeaderMap) -> String {
+    headers
+        .get("x-request-id")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("unknown")
+        .to_string()
 }
 
 async fn live() -> StatusCode {
@@ -87,14 +130,17 @@ async fn ready(State(state): State<AppState>) -> ApiResult<Json<Value>> {
     } else {
         Err(ApiError::new(
             StatusCode::SERVICE_UNAVAILABLE,
+            "dependencies_not_ready",
             "dependencies not ready",
-            body,
-        ))
+        )
+        .with_details(body))
     }
 }
 
-async fn services(State(state): State<AppState>) -> Json<Value> {
-    Json(serde_json::json!({ "services": list_services(&state.catalog) }))
+async fn services(State(state): State<AppState>) -> ApiResult<Json<Value>> {
+    Ok(Json(
+        serde_json::json!({ "services": list_services(&state.catalog) }),
+    ))
 }
 
 async fn service(
@@ -102,31 +148,32 @@ async fn service(
     Path(service_id): Path<String>,
 ) -> ApiResult<Json<Value>> {
     let s = get_service(&state.catalog, &service_id).map_err(ApiError::from)?;
-    Ok(Json(serde_json::to_value(s).unwrap_or(Value::Null)))
+    let value = serde_json::to_value(s).map_err(|e| ApiError::bad_request(e.to_string()))?;
+    Ok(Json(value))
 }
 
 async fn provider(
     State(state): State<AppState>,
     Path(address): Path<String>,
 ) -> ApiResult<Json<Value>> {
-    reject_private_key_field(&serde_json::json!({ "address": address }))?;
+    reject_secrets(&serde_json::json!({ "address": address }))?;
     let pk = parse_pubkey(&address).map_err(|e| ApiError::bad_request(e.to_string()))?;
     let program = state.cfg.program_pubkey().map_err(ApiError::from)?;
-    let account = inspect_provider(state.reader.as_ref(), &program, &pk)
+    let account = inspect_provider_dto(state.reader.as_ref(), &program, &pk)
         .await
         .map_err(ApiError::from)?;
-    Ok(Json(
-        serde_json::json!({ "provider": format!("{account:?}") }),
-    ))
+    let value = serde_json::to_value(account).map_err(|e| ApiError::bad_request(e.to_string()))?;
+    Ok(Json(serde_json::json!({ "provider": value })))
 }
 
 async fn job(State(state): State<AppState>, Path(address): Path<String>) -> ApiResult<Json<Value>> {
     let pk = parse_pubkey(&address).map_err(|e| ApiError::bad_request(e.to_string()))?;
     let program = state.cfg.program_pubkey().map_err(ApiError::from)?;
-    let account = inspect_job(state.reader.as_ref(), &program, &pk)
+    let account = inspect_job_dto(state.reader.as_ref(), &program, &pk)
         .await
         .map_err(ApiError::from)?;
-    Ok(Json(serde_json::json!({ "job": format!("{account:?}") })))
+    let value = serde_json::to_value(account).map_err(|e| ApiError::bad_request(e.to_string()))?;
+    Ok(Json(serde_json::json!({ "job": value })))
 }
 
 fn parse_json_body<T: serde::de::DeserializeOwned>(value: Value) -> ApiResult<T> {
@@ -153,7 +200,9 @@ async fn plan_fund(
 ) -> ApiResult<Json<Value>> {
     let req: FundJobRequest = parse_json_body(raw)?;
     let plan = build_fund_job_plan(&state.cfg, &req).map_err(ApiError::from)?;
-    Ok(Json(serde_json::to_value(plan).unwrap_or(Value::Null)))
+    Ok(Json(
+        serde_json::to_value(plan).map_err(|e| ApiError::bad_request(e.to_string()))?,
+    ))
 }
 
 async fn plan_accept(
@@ -162,7 +211,9 @@ async fn plan_accept(
 ) -> ApiResult<Json<Value>> {
     let req: AcceptJobRequest = parse_json_body(raw)?;
     let plan = build_accept_job_plan(&state.cfg, &req).map_err(ApiError::from)?;
-    Ok(Json(serde_json::to_value(plan).unwrap_or(Value::Null)))
+    Ok(Json(
+        serde_json::to_value(plan).map_err(|e| ApiError::bad_request(e.to_string()))?,
+    ))
 }
 
 async fn plan_submit(
@@ -170,8 +221,12 @@ async fn plan_submit(
     Json(raw): Json<Value>,
 ) -> ApiResult<Json<Value>> {
     let req: SubmitReceiptRequest = parse_json_body(raw)?;
-    let plan = build_submit_receipt_plan_uc(&state.cfg, &req).map_err(ApiError::from)?;
-    Ok(Json(serde_json::to_value(plan).unwrap_or(Value::Null)))
+    let plan = build_submit_receipt_plan_uc(&state.cfg, state.reader.as_ref(), &req)
+        .await
+        .map_err(ApiError::from)?;
+    Ok(Json(
+        serde_json::to_value(plan).map_err(|e| ApiError::bad_request(e.to_string()))?,
+    ))
 }
 
 async fn plan_accept_work(
@@ -180,7 +235,9 @@ async fn plan_accept_work(
 ) -> ApiResult<Json<Value>> {
     let req: AcceptWorkRequest = parse_json_body(raw)?;
     let plan = build_accept_work_plan(&state.cfg, &req).map_err(ApiError::from)?;
-    Ok(Json(serde_json::to_value(plan).unwrap_or(Value::Null)))
+    Ok(Json(
+        serde_json::to_value(plan).map_err(|e| ApiError::bad_request(e.to_string()))?,
+    ))
 }
 
 async fn plan_challenge(
@@ -189,7 +246,9 @@ async fn plan_challenge(
 ) -> ApiResult<Json<Value>> {
     let req: ChallengeRequest = parse_json_body(raw)?;
     let plan = build_challenge_plan(&state.cfg, &req).map_err(ApiError::from)?;
-    Ok(Json(serde_json::to_value(plan).unwrap_or(Value::Null)))
+    Ok(Json(
+        serde_json::to_value(plan).map_err(|e| ApiError::bad_request(e.to_string()))?,
+    ))
 }
 
 async fn plan_timeout(
@@ -200,7 +259,9 @@ async fn plan_timeout(
     let plan = build_timeout_plan(&state.cfg, state.reader.as_ref(), &req)
         .await
         .map_err(ApiError::from)?;
-    Ok(Json(serde_json::to_value(plan).unwrap_or(Value::Null)))
+    Ok(Json(
+        serde_json::to_value(plan).map_err(|e| ApiError::bad_request(e.to_string()))?,
+    ))
 }
 
 #[derive(Deserialize)]
@@ -214,7 +275,6 @@ async fn x402_invoke(
     headers: HeaderMap,
     Json(body): Json<X402Body>,
 ) -> ApiResult<(StatusCode, HeaderMap, Json<Value>)> {
-    // Escrow routes never call facilitator; this route never builds escrow plans.
     let service = get_service(&state.catalog, &service_id).map_err(ApiError::from)?;
     if service.x402_demo_route.is_none() {
         return Err(ApiError::bad_request("service has no x402 demo route"));
@@ -223,28 +283,28 @@ async fn x402_invoke(
         network: state.cfg.x402_network.clone(),
         asset: state.cfg.settlement_mint.clone(),
         pay_to: state.cfg.merchant_pay_to.clone(),
+        fee_payer: state.cfg.x402_fee_payer.clone(),
         amount: state.cfg.x402_amount.clone(),
         max_timeout_seconds: 60,
         resource_url: format!("/v1/x402/services/{service_id}/invoke"),
         description: service.description.clone(),
+        service_id: service_id.clone(),
     };
     let payment = headers.get(PAYMENT_SIGNATURE).and_then(|v| v.to_str().ok());
-    let now = state.reader.get_unix_timestamp().await.unwrap_or(0);
-    let mut issued = state.requirements_issued_at.lock().await;
-    let issued_at = issued.unwrap_or(now);
-    if issued.is_none() {
-        *issued = Some(now);
-    }
-    drop(issued);
+    let now = state
+        .reader
+        .get_unix_timestamp()
+        .await
+        .map_err(|e| ApiError::new(StatusCode::BAD_GATEWAY, "clock_error", e.to_string()))?;
 
     match invoke_paid_demo(
         &resource,
         state.facilitator.as_ref(),
-        state.payment_cache.as_ref(),
+        state.challenges.as_ref(),
+        state.settlements.as_ref(),
         payment,
         &body.input,
         now,
-        issued_at,
     )
     .await
     {
@@ -273,20 +333,12 @@ async fn x402_invoke(
     }
 }
 
-fn reject_private_key_field(v: &Value) -> ApiResult<()> {
-    reject_secrets(v)
-}
-
 fn reject_secrets(v: &Value) -> ApiResult<()> {
     match v {
         Value::Object(map) => {
             for (k, val) in map {
                 let key = k.to_ascii_lowercase();
-                if key.contains("private")
-                    || key.contains("secret")
-                    || key == "keypair"
-                    || key.ends_with("_key") && key.contains("private")
-                {
+                if key.contains("private") || key.contains("secret") || key == "keypair" {
                     return Err(ApiError::bad_request("private key fields are not accepted"));
                 }
                 reject_secrets(val)?;
@@ -302,19 +354,7 @@ fn reject_secrets(v: &Value) -> ApiResult<()> {
     Ok(())
 }
 
-/// Test helper: build AppState with mocks.
-pub fn test_state(
-    cfg: agentbond_app::AppConfig,
-    catalog: agentbond_app::ServiceCatalog,
-    reader: Arc<dyn agentbond_sdk::ChainReader>,
-    facilitator: Arc<dyn agentbond_payments::FacilitatorClient>,
-) -> AppState {
-    AppState {
-        cfg: Arc::new(cfg),
-        catalog: Arc::new(catalog),
-        reader,
-        facilitator,
-        payment_cache: Arc::new(PaymentCache::new()),
-        requirements_issued_at: Arc::new(tokio::sync::Mutex::new(None)),
-    }
+#[allow(dead_code)]
+fn _touch_request_id(headers: &HeaderMap) -> String {
+    request_id_from(headers)
 }

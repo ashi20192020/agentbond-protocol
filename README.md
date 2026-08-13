@@ -109,17 +109,35 @@ From `host/`:
 ```bash
 cargo run -p agentbond-cli -- address config
 cargo run -p agentbond-cli -- inspect job <JOB_PUBKEY> --rpc-url http://127.0.0.1:8899
-cargo run -p agentbond-cli -- receipt create --json
+cargo run -p agentbond-cli -- receipt create \
+  --program-id <PK> --job <PK> --provider <PK> --buyer <PK> \
+  --job-nonce 1 --amount 5000 --work-hash <64hex> --output-hash <64hex> \
+  --issued-at <unix> --expires-at <unix> \
+  --execution-keypair ./exec.json --json
 cargo run -p agentbond-cli -- plan create-job --buyer <PK> --provider <PK> --job-nonce 1 --amount 5000 --json
 cargo run -p agentbond-cli -- send --rpc-url http://127.0.0.1:8899 --payer-keypair ./payer.json --signer ./other.json --plan ./plan.json --yes
 ```
 
-Send rules:
+Plan subcommands cover every protocol instruction:
+
+`initialize-config`, `set-paused`, `register-provider`, `add-execution-key`, `revoke-execution-key`, `deposit-bond`, `withdraw-bond`, `create-job`, `fund-job`, `accept-job`, `submit-receipt`, `accept-work`, `challenge-work`, `resolve-timeout`, `expire-unfunded`, `expire-unaccepted`, `slash-bond`, `close-job`.
+
+Plans reuse `agentbond-sdk` builders (no duplicated account ordering). Human and `--json` output are supported. `receipt create` requires every receipt field or a complete input file; it never inserts hidden defaults.
+
+Send flow (bounded RPC, no fake blockhash):
+
+1. `getGenesisHash` → detect cluster; reject mainnet unless `--allow-mainnet` (genesis hash, not RPC URL text)
+2. `getLatestBlockhash` → build transaction
+3. Confirm required signers → `simulateTransaction` → stop on failure
+4. Single `sendTransaction` → poll `getSignatureStatuses` to a fixed deadline
+
+Loaded plans allow only AgentBond instructions, plus an Ed25519 precompile immediately before `SubmitReceipt`. `plan.program_id` must match the configured program. Expired plans and missing signers are rejected. Before `--yes`, the CLI prints network, program ID, action, mint, amount, and required signers.
+
+Additional send rules:
 
 - No default private-key path; Solana CLI default keypair is never auto-used
-- Mainnet rejected unless `--allow-mainnet` is set
 - `--yes` required for non-interactive submission
-- Simulate / readiness check before local signing; no indefinite retries
+- No indefinite signing or submission retries
 
 ## Gateway endpoints
 
@@ -142,40 +160,52 @@ POST /v1/plans/jobs/resolve-timeout
 POST /v1/x402/services/{service_id}/invoke
 ```
 
-Run with example config (mock deps for local smoke):
+Production gateway uses HTTP RPC and the configured facilitator. For local smoke with mock chain/facilitator:
 
 ```bash
 cd host
 AGENTBOND_USE_MOCK=1 cargo run -p agentbond-gateway -- config/example.config.json
 ```
 
+Config requires `x402_fee_payer` (public key). RPC and facilitator URLs must not embed credentials. Responses include `x-request-id`; structured errors expose a stable code, safe message, and request id (no stack traces).
+
 The gateway never holds user private keys. Escrow plan routes never call the facilitator. The x402 demo route never builds AgentBond escrow plans.
 
 ## MCP setup
+
+Production MCP validates config and uses `HttpChainReader` by default. Logging goes to stderr so stdio framing stays intact.
 
 ```bash
 cd host
 cargo run -p agentbond-mcp -- config/example.config.json
 ```
 
+Explicit local mock mode only:
+
+```bash
+AGENTBOND_USE_MOCK=1 cargo run -p agentbond-mcp -- config/example.config.json
+```
+
 Tools: `discover_services`, `inspect_provider`, `inspect_job`, `build_create_job`, `build_fund_job`, `build_submit_receipt`, `build_accept_work`, `build_challenge`, `build_timeout_resolution`.
 
-MCP tools build unsigned instruction plans. They do not sign or submit them. Private keys are not accepted.
+JSON Schema types match request fields (addresses/hashes as strings; nonces/amounts/timestamps as integers; booleans; structured receipt). MCP tools build unsigned instruction plans only. They do not sign or submit and do not accept private keys. Protocol version: `2026-07-28`.
 
 ## x402 paid-demo flow
 
 The x402 code is a **narrow AgentBond resource-server adapter** for `scheme = exact` on a configured Solana network. It is **not** an official or complete Rust x402 SDK. AgentBond does not ship a custom facilitator.
 
+Exact SVM requirements include typed `extra.feePayer` (camelCase), plus optional `memo`, `recentBlockhash`, and `lastValidBlockHeight`. Each payment challenge issues a unique ≥16-byte hex memo bound to service, resource URL, merchant, asset, amount, network, input digest, and issuance time. Challenges use a bounded TTL store; there is no global `requirements_issued_at` that expires unrelated payments.
+
 `POST /v1/x402/services/{service_id}/invoke`:
 
 1. Missing `PAYMENT-SIGNATURE` → HTTP 402 with `PAYMENT-REQUIRED`
-2. Decode and validate the payment header
-3. Facilitator `verify`
+2. Decode and validate the payment header (version, resource, scheme, network, asset, amount, `payTo`, timeouts, `extra.feePayer`, challenge memo, single Base64 transaction within Solana size limits)
+3. Facilitator `verify` (readiness via facilitator `/supported` for `scheme=exact` and configured network)
 4. Deterministic demo transform (hash/echo of input — not an AI model)
-5. Facilitator `settle`
+5. Facilitator `settle` behind an atomic settlement state machine keyed by transaction digest: `Unseen → Settling → Settled` (120s TTL, bounded capacity, targeted eviction)
 6. HTTP 200 with resource body and `PAYMENT-RESPONSE`
 
-An in-memory payment-result cache supports retries. Persistent payment recovery belongs to Milestone 4.
+Exact retry after success may return the cached identical response. Concurrent duplicates do not settle twice. Different binding for the same transaction is rejected. Persistent payment recovery belongs to Milestone 4.
 
 Do not describe AgentBond escrow as x402 escrow. These rails are separate.
 
@@ -251,11 +281,17 @@ cargo run --manifest-path host/Cargo.toml -p agentbond-sim
 
 Build the SBF binary before LiteSVM program tests or the simulator so they can load `target/deploy/agentbond.so`.
 
+Current offline verification counts (no internet):
+
+- Root workspace: **127** tests passed
+- Host workspace: **41** tests passed
+- Simulator: all **6** scenarios passed
+
 ## Program binary size
 
 After `cargo build-sbf --features bpf-entrypoint`:
 
-- `target/deploy/agentbond.so` = **145,976 bytes** (`wc -c`)
+- `target/deploy/agentbond.so` = **151,480 bytes** (`wc -c`)
 
 ## Compute-unit results
 

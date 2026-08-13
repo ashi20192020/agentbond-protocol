@@ -1,17 +1,13 @@
 use sha2::{Digest, Sha256};
-use std::collections::HashMap;
-use std::sync::Arc;
-use tokio::sync::Mutex;
 
+use crate::challenge::ChallengeStore;
 use crate::error::PaymentError;
 use crate::facilitator::FacilitatorClient;
 use crate::headers::{
     decode_payment_signature_header, encode_payment_required_header, encode_payment_response_header,
 };
-use crate::models::{
-    PaymentRequired, PaymentRequirements, ResourceInfo, SCHEME_EXACT, SettleRequest,
-    SettleResponse, VerifyRequest, X402_VERSION,
-};
+use crate::models::{PaymentRequired, ResourceInfo, SettleRequest, VerifyRequest, X402_VERSION};
+use crate::settlement::{SettlementBinding, SettlementStore};
 use crate::validate::validate_payment_payload;
 
 #[derive(Clone, Debug)]
@@ -19,10 +15,12 @@ pub struct X402ResourceConfig {
     pub network: String,
     pub asset: String,
     pub pay_to: String,
+    pub fee_payer: String,
     pub amount: String,
     pub max_timeout_seconds: u64,
     pub resource_url: String,
     pub description: String,
+    pub service_id: String,
 }
 
 #[derive(Clone, Debug)]
@@ -31,105 +29,121 @@ pub struct PaidDemoResult {
     pub payment_response_header: String,
 }
 
-#[derive(Default)]
-pub struct PaymentCache {
-    inner: Mutex<HashMap<String, PaidDemoResult>>,
+pub fn input_digest(input: &serde_json::Value) -> Result<String, PaymentError> {
+    let bytes = serde_json::to_vec(input).map_err(|_| PaymentError::InvalidJson)?;
+    let digest = Sha256::digest(bytes);
+    Ok(digest.iter().map(|b| format!("{b:02x}")).collect())
 }
 
-impl PaymentCache {
-    pub fn new() -> Self {
-        Self::default()
-    }
-
-    pub async fn get(&self, key: &str) -> Option<PaidDemoResult> {
-        self.inner.lock().await.get(key).cloned()
-    }
-
-    pub async fn insert(&self, key: String, value: PaidDemoResult) {
-        let mut guard = self.inner.lock().await;
-        if guard.len() >= 256 {
-            guard.clear();
-        }
-        guard.insert(key, value);
-    }
-}
-
-pub fn build_payment_required(
-    cfg: &X402ResourceConfig,
-) -> Result<(PaymentRequired, PaymentRequirements, String), PaymentError> {
-    let requirements = PaymentRequirements {
-        scheme: SCHEME_EXACT.into(),
-        network: cfg.network.clone(),
-        amount: cfg.amount.clone(),
-        asset: cfg.asset.clone(),
-        pay_to: cfg.pay_to.clone(),
-        max_timeout_seconds: cfg.max_timeout_seconds,
-        extra: None,
-    };
-    let required = PaymentRequired {
-        x402_version: X402_VERSION,
-        error: Some("PAYMENT-SIGNATURE header is required".into()),
-        resource: ResourceInfo {
-            url: cfg.resource_url.clone(),
-            description: cfg.description.clone(),
-            mime_type: "application/json".into(),
-        },
-        accepts: vec![requirements.clone()],
-    };
-    let header = encode_payment_required_header(&required)?;
-    Ok((required, requirements, header))
-}
-
+/// Result: Ok(Ok(paid)) | Ok(Err(payment_required_header)) | Err(...)
 pub async fn invoke_paid_demo(
     cfg: &X402ResourceConfig,
     facilitator: &dyn FacilitatorClient,
-    cache: &PaymentCache,
+    challenges: &ChallengeStore,
+    settlements: &SettlementStore,
     payment_header: Option<&str>,
     input: &serde_json::Value,
     now_unix: i64,
-    issued_at: i64,
 ) -> Result<Result<PaidDemoResult, String>, PaymentError> {
-    let (_required, requirements, payment_required_header) = build_payment_required(cfg)?;
-    let Some(header) = payment_header else {
-        return Ok(Err(payment_required_header));
+    let digest = input_digest(input)?;
+    let resource = ResourceInfo {
+        url: cfg.resource_url.clone(),
+        description: cfg.description.clone(),
+        mime_type: "application/json".into(),
     };
 
-    if let Some(cached) = cache.get(header).await {
+    let Some(header) = payment_header else {
+        let (requirements, _) = challenges.issue(cfg, &resource, &digest, now_unix).await?;
+        let required = PaymentRequired {
+            x402_version: X402_VERSION,
+            error: Some("PAYMENT-SIGNATURE header is required".into()),
+            resource,
+            accepts: vec![requirements],
+        };
+        let encoded = encode_payment_required_header(&required)?;
+        return Ok(Err(encoded));
+    };
+
+    let payload = decode_payment_signature_header(header)?;
+    let memo = payload
+        .accepted
+        .extra
+        .memo
+        .clone()
+        .ok_or(PaymentError::InvalidChallenge)?;
+    let challenge = challenges.get_valid(&memo, now_unix).await?;
+    let expected = crate::models::PaymentRequirements {
+        scheme: crate::models::SCHEME_EXACT.into(),
+        network: challenge.network.clone(),
+        amount: challenge.amount.clone(),
+        asset: challenge.asset.clone(),
+        pay_to: challenge.merchant.clone(),
+        max_timeout_seconds: challenge.max_timeout_seconds,
+        extra: crate::models::SvmExactExtra {
+            fee_payer: challenge.fee_payer.clone(),
+            memo: Some(challenge.memo.clone()),
+            recent_blockhash: None,
+            last_valid_block_height: None,
+        },
+    };
+    let tx_b64 = validate_payment_payload(&payload, &expected, &challenge, now_unix, &digest)?;
+    let tx_digest = SettlementStore::tx_digest(&tx_b64);
+    let binding = SettlementBinding {
+        service_id: cfg.service_id.clone(),
+        resource_url: cfg.resource_url.clone(),
+        input_digest: digest,
+        challenge_memo: challenge.memo.clone(),
+    };
+
+    if let Some(cached) = settlements.begin(&tx_digest, binding.clone()).await? {
         return Ok(Ok(cached));
     }
 
-    let payload = decode_payment_signature_header(header)?;
-    validate_payment_payload(&payload, &requirements, now_unix, issued_at)?;
-
-    let verify = facilitator
+    let verify = match facilitator
         .verify(&VerifyRequest {
             x402_version: X402_VERSION,
             payment_payload: payload.clone(),
-            payment_requirements: requirements.clone(),
+            payment_requirements: expected.clone(),
         })
-        .await?;
+        .await
+    {
+        Ok(v) => v,
+        Err(e) => {
+            settlements.fail(&tx_digest, &binding).await;
+            return Err(e);
+        }
+    };
     if !verify.is_valid {
+        settlements.fail(&tx_digest, &binding).await;
         return Err(PaymentError::VerifyRejected);
     }
 
     // Deterministic transform only — not an AI model.
     let input_bytes = serde_json::to_vec(input).map_err(|_| PaymentError::InvalidJson)?;
-    let digest = Sha256::digest(input_bytes);
+    let body_digest = Sha256::digest(&input_bytes);
     let body = serde_json::json!({
         "service": "agentbond-x402-demo",
-        "input_sha256": hex::encode(digest),
+        "input_sha256": body_digest.iter().map(|b| format!("{b:02x}")).collect::<String>(),
         "echo": input,
         "note": "deterministic paid demo resource",
     });
 
-    let settle = facilitator
+    let settle = match facilitator
         .settle(&SettleRequest {
             x402_version: X402_VERSION,
             payment_payload: payload,
-            payment_requirements: requirements,
+            payment_requirements: expected,
         })
-        .await?;
+        .await
+    {
+        Ok(s) => s,
+        Err(e) => {
+            settlements.fail(&tx_digest, &binding).await;
+            return Err(e);
+        }
+    };
     if !settle.success {
+        settlements.fail(&tx_digest, &binding).await;
         return Err(PaymentError::SettleRejected);
     }
 
@@ -138,32 +152,12 @@ pub async fn invoke_paid_demo(
         body,
         payment_response_header: response_header,
     };
-    cache.insert(header.to_string(), result.clone()).await;
+    settlements
+        .complete(&tx_digest, &binding, result.clone())
+        .await?;
     Ok(Ok(result))
 }
 
-// Avoid pulling hex workspace dep into payments — use simple encode.
-mod hex {
-    pub fn encode(bytes: impl AsRef<[u8]>) -> String {
-        const HEX: &[u8; 16] = b"0123456789abcdef";
-        let bytes = bytes.as_ref();
-        let mut out = String::with_capacity(bytes.len() * 2);
-        for b in bytes {
-            out.push(HEX[(b >> 4) as usize] as char);
-            out.push(HEX[(b & 0xf) as usize] as char);
-        }
-        out
-    }
-}
-
-pub fn settle_response_ok() -> SettleResponse {
-    SettleResponse {
-        success: true,
-        error_reason: None,
-        transaction: Some("cached".into()),
-        network: None,
-        payer: None,
-    }
-}
-
-pub type SharedFacilitator = Arc<dyn FacilitatorClient>;
+/// Compatibility alias removed PaymentCache — use SettlementStore.
+#[deprecated(note = "use SettlementStore")]
+pub type PaymentCache = SettlementStore;

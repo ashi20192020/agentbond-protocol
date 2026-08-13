@@ -2,8 +2,9 @@
 
 use agentbond_app::{
     AcceptJobRequest, AcceptWorkRequest, AppConfig, ChallengeRequest, CreateJobRequest,
-    FundJobRequest, ServiceCatalog, ServiceEntry, build_accept_job_plan, build_accept_work_plan,
-    build_challenge_plan, build_create_job_plan, build_fund_job_plan,
+    FundJobRequest, ServiceCatalog, ServiceEntry, TimeoutRequest, build_accept_job_plan,
+    build_accept_work_plan, build_challenge_plan, build_create_job_plan, build_fund_job_plan,
+    build_timeout_plan,
 };
 use agentbond_sdk::{AccountData, ChainReader, MockChainReader, job_pda, program_id};
 use agentbond_types::{JobAccount, JobState};
@@ -20,6 +21,7 @@ fn test_config() -> AppConfig {
         token_program: TOKEN_PROGRAM.into(),
         facilitator_url: "http://127.0.0.1:9090".into(),
         merchant_pay_to: "11111111111111111111111111111112".into(),
+        x402_fee_payer: "11111111111111111111111111111113".into(),
         x402_amount: "1000".into(),
         x402_network: "solana:localnet".into(),
         request_timeout_ms: 5000,
@@ -156,7 +158,10 @@ async fn plan_builder_smoke_with_mock_reader() {
         state: JobState::Created,
         buyer: buyer_pk.to_bytes(),
         provider: provider_pk.to_bytes(),
-        mint: [0u8; 32],
+        mint: "11111111111111111111111111111111"
+            .parse::<Pubkey>()
+            .expect("mint")
+            .to_bytes(),
         token_program: TOKEN_PROGRAM
             .parse::<Pubkey>()
             .expect("token program")
@@ -183,4 +188,62 @@ async fn plan_builder_smoke_with_mock_reader() {
         )
         .await;
     assert!(reader.get_account(&job_addr).await.expect("get").is_some());
+
+    // Created: ineligible before fund_deadline.
+    reader.set_timestamp(1_700_000_049).await;
+    let req = TimeoutRequest {
+        payer: buyer.into(),
+        buyer: buyer.into(),
+        provider: provider.into(),
+        job_nonce: 1,
+    };
+    assert!(build_timeout_plan(&cfg, &reader, &req).await.is_err());
+    // Created: eligible at fund_deadline.
+    reader.set_timestamp(1_700_000_050).await;
+    let plan = build_timeout_plan(&cfg, &reader, &req)
+        .await
+        .expect("expire");
+    assert_eq!(plan.action, "expire_unfunded");
+
+    // Funded before accept_deadline ineligible.
+    let mut funded = job;
+    funded.state = JobState::Funded;
+    reader
+        .set_account(
+            job_addr,
+            AccountData {
+                owner: program,
+                data: funded.encode().to_vec(),
+                lamports: 1,
+            },
+        )
+        .await;
+    reader.set_timestamp(1_700_000_199).await;
+    assert!(build_timeout_plan(&cfg, &reader, &req).await.is_err());
+    reader.set_timestamp(1_700_000_200).await;
+    let plan = build_timeout_plan(&cfg, &reader, &req)
+        .await
+        .expect("refund funded");
+    assert_eq!(plan.action, "resolve_timeout_refund");
+
+    // Accepted: eligible only when now > work_deadline.
+    let mut accepted = funded;
+    accepted.state = JobState::Accepted;
+    reader
+        .set_account(
+            job_addr,
+            AccountData {
+                owner: program,
+                data: accepted.encode().to_vec(),
+                lamports: 1,
+            },
+        )
+        .await;
+    reader.set_timestamp(1_700_000_300).await;
+    assert!(build_timeout_plan(&cfg, &reader, &req).await.is_err());
+    reader.set_timestamp(1_700_000_301).await;
+    let plan = build_timeout_plan(&cfg, &reader, &req)
+        .await
+        .expect("refund accepted");
+    assert_eq!(plan.action, "resolve_timeout_refund");
 }

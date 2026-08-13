@@ -9,6 +9,8 @@ use crate::error::AppError;
 const MAX_NAME: usize = 64;
 const MAX_DESC: usize = 256;
 const MAX_SERVICES: usize = 128;
+const MAX_SERVICE_ID: usize = 64;
+const MAX_ROUTE: usize = 128;
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ServiceEntry {
@@ -71,8 +73,25 @@ fn validate_entries(entries: &[ServiceEntry]) -> Result<(), AppError> {
                 "service fields must be non-empty".into(),
             ));
         }
-        if entry.name.len() > MAX_NAME || entry.description.len() > MAX_DESC {
+        if entry.service_id.len() > MAX_SERVICE_ID
+            || entry.name.len() > MAX_NAME
+            || entry.description.len() > MAX_DESC
+        {
             return Err(AppError::Validation("service text too long".into()));
+        }
+        if !entry
+            .service_id
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
+        {
+            return Err(AppError::Validation(
+                "service_id must be normalized ascii".into(),
+            ));
+        }
+        if entry.x402_demo_route.as_deref().is_some_and(|route| {
+            route.is_empty() || route.len() > MAX_ROUTE || !route.starts_with('/')
+        }) {
+            return Err(AppError::Validation("invalid x402_demo_route".into()));
         }
         if !ids.insert(entry.service_id.clone()) {
             return Err(AppError::Validation(format!(

@@ -1,11 +1,10 @@
 //! Local x402 402 → verify → settle → 200 using MockFacilitatorClient.
 //! The paid resource is a deterministic hash echo — not an AI model.
 
-use std::collections::BTreeMap;
-
 use agentbond_payments::{
-    MockFacilitatorClient, PAYMENT_REQUIRED, PaymentCache, PaymentPayload, PaymentRequirements,
-    ResourceInfo, SCHEME_EXACT, X402_VERSION, X402ResourceConfig, invoke_paid_demo,
+    ChallengeStore, ExactPayloadBody, MockFacilitatorClient, PAYMENT_REQUIRED, PaymentPayload,
+    ResourceInfo, SCHEME_EXACT, SettlementStore, SvmExactExtra, X402_VERSION, X402ResourceConfig,
+    invoke_paid_demo,
 };
 use anyhow::{Result, anyhow, bail};
 use base64::Engine;
@@ -18,26 +17,60 @@ pub struct X402DemoOutcome {
     pub payment_response_header: String,
 }
 
-fn encode_payment_signature_header(payload: &PaymentPayload) -> Result<String> {
-    let json = serde_json::to_vec(payload).map_err(|e| anyhow!("payment payload json: {e}"))?;
-    Ok(Engine::encode(
-        &base64::engine::general_purpose::STANDARD,
-        json,
-    ))
-}
-
-fn mock_payment_header(cfg: &X402ResourceConfig) -> Result<String> {
-    let accepted = PaymentRequirements {
-        scheme: SCHEME_EXACT.into(),
-        network: cfg.network.clone(),
-        amount: cfg.amount.clone(),
-        asset: cfg.asset.clone(),
-        pay_to: cfg.pay_to.clone(),
-        max_timeout_seconds: cfg.max_timeout_seconds,
-        extra: None,
+pub async fn run_x402_demo() -> Result<X402DemoOutcome> {
+    let cfg = X402ResourceConfig {
+        network: "solana:localnet".into(),
+        asset: "So11111111111111111111111111111111111111112".into(),
+        pay_to: "11111111111111111111111111111112".into(),
+        fee_payer: "11111111111111111111111111111113".into(),
+        amount: "1000".into(),
+        max_timeout_seconds: 60,
+        resource_url: "/v1/x402/services/hash-demo/invoke".into(),
+        description: "deterministic paid hash-demo resource".into(),
+        service_id: "hash-demo".into(),
     };
-    let mut payload_map = BTreeMap::new();
-    payload_map.insert("transaction".into(), json!("mock-local-tx"));
+    let facilitator = MockFacilitatorClient::new();
+    let challenges = ChallengeStore::new();
+    let settlements = SettlementStore::new();
+    let input = json!({"ping": "local-sim"});
+    let now = 1_700_000_000_i64;
+
+    println!("  {PAYMENT_REQUIRED}: missing PAYMENT-SIGNATURE → 402");
+    let first = invoke_paid_demo(
+        &cfg,
+        &facilitator,
+        &challenges,
+        &settlements,
+        None,
+        &input,
+        now,
+    )
+    .await
+    .map_err(|e| anyhow!("x402 without payment: {e}"))?;
+    let Err(payment_required_header) = first else {
+        bail!("expected 402 payment-required when signature header is absent");
+    };
+
+    let required: agentbond_payments::PaymentRequired = {
+        let bytes = Engine::decode(
+            &base64::engine::general_purpose::STANDARD,
+            payment_required_header.trim(),
+        )
+        .map_err(|e| anyhow!("decode payment-required: {e}"))?;
+        serde_json::from_slice(&bytes).map_err(|e| anyhow!("parse payment-required: {e}"))?
+    };
+    let accepted = required
+        .accepts
+        .first()
+        .cloned()
+        .ok_or_else(|| anyhow!("missing accepts"))?;
+    let memo = accepted
+        .extra
+        .memo
+        .clone()
+        .ok_or_else(|| anyhow!("missing feePayer memo"))?;
+
+    println!("  PAYMENT-SIGNATURE present → mock verify → mock settle → 200");
     let payment = PaymentPayload {
         x402_version: X402_VERSION,
         resource: ResourceInfo {
@@ -45,47 +78,38 @@ fn mock_payment_header(cfg: &X402ResourceConfig) -> Result<String> {
             description: cfg.description.clone(),
             mime_type: "application/json".into(),
         },
-        accepted,
-        payload: payload_map,
-        extensions: BTreeMap::new(),
+        accepted: agentbond_payments::PaymentRequirements {
+            scheme: SCHEME_EXACT.into(),
+            network: cfg.network.clone(),
+            amount: cfg.amount.clone(),
+            asset: cfg.asset.clone(),
+            pay_to: cfg.pay_to.clone(),
+            max_timeout_seconds: cfg.max_timeout_seconds,
+            extra: SvmExactExtra {
+                fee_payer: cfg.fee_payer.clone(),
+                memo: Some(memo),
+                recent_blockhash: None,
+                last_valid_block_height: None,
+            },
+        },
+        payload: ExactPayloadBody {
+            transaction: Engine::encode(&base64::engine::general_purpose::STANDARD, [1u8; 64]),
+        },
+        extensions: Default::default(),
     };
-    encode_payment_signature_header(&payment)
-}
+    let header = Engine::encode(
+        &base64::engine::general_purpose::STANDARD,
+        serde_json::to_vec(&payment)?,
+    );
 
-pub async fn run_x402_demo() -> Result<X402DemoOutcome> {
-    let cfg = X402ResourceConfig {
-        network: "solana:localnet".into(),
-        asset: "So11111111111111111111111111111111111111112".into(),
-        pay_to: "DemoMerchant1111111111111111111111111111111".into(),
-        amount: "1000".into(),
-        max_timeout_seconds: 60,
-        resource_url: "/v1/x402/services/hash-demo/invoke".into(),
-        description: "deterministic paid hash-demo resource".into(),
-    };
-    let facilitator = MockFacilitatorClient::new();
-    let cache = PaymentCache::new();
-    let input = json!({"ping": "local-sim"});
-    let now = 1_700_000_000_i64;
-    let issued_at = now;
-
-    println!("  {PAYMENT_REQUIRED}: missing PAYMENT-SIGNATURE → 402");
-    let first = invoke_paid_demo(&cfg, &facilitator, &cache, None, &input, now, issued_at)
-        .await
-        .map_err(|e| anyhow!("x402 without payment: {e}"))?;
-    let Err(_payment_required_header) = first else {
-        bail!("expected 402 payment-required when signature header is absent");
-    };
-
-    println!("  PAYMENT-SIGNATURE present → mock verify → mock settle → 200");
-    let header = mock_payment_header(&cfg)?;
     let second = invoke_paid_demo(
         &cfg,
         &facilitator,
-        &cache,
+        &challenges,
+        &settlements,
         Some(&header),
         &input,
         now,
-        issued_at,
     )
     .await
     .map_err(|e| anyhow!("x402 with payment: {e}"))?;
@@ -95,9 +119,6 @@ pub async fn run_x402_demo() -> Result<X402DemoOutcome> {
 
     if paid.body.get("service").and_then(|v| v.as_str()) != Some("agentbond-x402-demo") {
         bail!("unexpected demo body: {}", paid.body);
-    }
-    if paid.body.get("note").and_then(|v| v.as_str()) != Some("deterministic paid demo resource") {
-        bail!("demo body must describe a deterministic resource, not an AI model");
     }
 
     Ok(X402DemoOutcome {

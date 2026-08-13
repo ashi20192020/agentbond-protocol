@@ -3,9 +3,13 @@ use serde::Deserialize;
 use solana_pubkey::Pubkey;
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::time::Duration;
 use tokio::sync::Mutex;
 
 use crate::error::SdkError;
+use crate::http_util::{build_http_client, read_body_bounded, reject_credentialed_url};
+
+pub const MAX_RPC_BODY_BYTES: usize = 256 * 1024;
 
 #[derive(Clone, Debug)]
 pub struct AccountData {
@@ -27,18 +31,14 @@ pub struct HttpChainReader {
 }
 
 impl HttpChainReader {
-    pub fn new(rpc_url: impl Into<String>, timeout: std::time::Duration) -> Result<Self, SdkError> {
-        let client = reqwest::Client::builder()
-            .timeout(timeout)
-            .build()
-            .map_err(|e| SdkError::Rpc(e.to_string()))?;
-        Ok(Self {
-            client,
-            rpc_url: rpc_url.into(),
-        })
+    pub fn new(rpc_url: impl Into<String>, timeout: Duration) -> Result<Self, SdkError> {
+        let rpc_url = rpc_url.into();
+        reject_credentialed_url(&rpc_url)?;
+        let client = build_http_client(timeout)?;
+        Ok(Self { client, rpc_url })
     }
 
-    async fn rpc_call<T: for<'de> Deserialize<'de>>(
+    pub(crate) async fn rpc_call<T: for<'de> Deserialize<'de>>(
         &self,
         method: &str,
         params: serde_json::Value,
@@ -55,18 +55,34 @@ impl HttpChainReader {
             .json(&body)
             .send()
             .await
-            .map_err(|e| SdkError::Rpc(e.to_string()))?;
+            .map_err(|e| {
+                if e.is_timeout() {
+                    SdkError::Rpc("rpc timeout".into())
+                } else {
+                    SdkError::Rpc(e.to_string())
+                }
+            })?;
+        if response.status().is_redirection() {
+            return Err(SdkError::Rpc("rpc redirects are not allowed".into()));
+        }
         if !response.status().is_success() {
             return Err(SdkError::Rpc(format!("http status {}", response.status())));
         }
-        let value: serde_json::Value = response
-            .json()
-            .await
-            .map_err(|e| SdkError::Rpc(e.to_string()))?;
+        let bytes = read_body_bounded(response, MAX_RPC_BODY_BYTES).await?;
+        let value: serde_json::Value =
+            serde_json::from_slice(&bytes).map_err(|e| SdkError::Rpc(e.to_string()))?;
         if let Some(err) = value.get("error") {
             return Err(SdkError::Rpc(err.to_string()));
         }
         serde_json::from_value(value["result"].clone()).map_err(|e| SdkError::Rpc(e.to_string()))
+    }
+
+    pub(crate) async fn rpc_call_string(
+        &self,
+        method: &str,
+        params: serde_json::Value,
+    ) -> Result<String, SdkError> {
+        self.rpc_call(method, params).await
     }
 }
 

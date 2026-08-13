@@ -6,6 +6,7 @@
   "token_program": "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA",
   "facilitator_url": "http://127.0.0.1:9090",
   "merchant_pay_to": "11111111111111111111111111111112",
+  "x402_fee_payer": "11111111111111111111111111111113",
   "x402_amount": "1000",
   "x402_network": "solana:localnet",
   "request_timeout_ms": 5000,
