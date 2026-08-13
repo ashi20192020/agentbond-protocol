@@ -27,6 +27,7 @@ pub struct YellowstoneConfig {
     pub x_token: Option<String>,
     pub program_id: Pubkey,
     pub connect_timeout: Duration,
+    pub from_slot: Option<u64>,
 }
 
 impl YellowstoneConfig {
@@ -36,7 +37,7 @@ impl YellowstoneConfig {
         validate_yellowstone_url(&url)?;
         let x_token = std::env::var("AGENTBOND_YELLOWSTONE_X_TOKEN").ok();
         let program_id = std::env::var("AGENTBOND_PROGRAM_ID")
-            .unwrap_or_else(|_| agentbond_sdk::program_id().to_string())
+            .map_err(|_| IndexerError::Config("AGENTBOND_PROGRAM_ID required".into()))?
             .parse()
             .map_err(|_| IndexerError::Config("bad AGENTBOND_PROGRAM_ID".into()))?;
         Ok(Self {
@@ -44,7 +45,13 @@ impl YellowstoneConfig {
             x_token,
             program_id,
             connect_timeout: Duration::from_secs(10),
+            from_slot: None,
         })
+    }
+
+    pub fn with_from_slot(mut self, slot: Option<u64>) -> Self {
+        self.from_slot = slot;
+        self
     }
 }
 
@@ -69,76 +76,8 @@ pub fn validate_yellowstone_url(url: &str) -> Result<(), IndexerError> {
     }
 }
 
-pub struct YellowstoneSource {
-    cfg: YellowstoneConfig,
-    metrics: IndexerMetrics,
-}
-
-impl YellowstoneSource {
-    pub fn new(cfg: YellowstoneConfig, metrics: IndexerMetrics) -> Self {
-        Self { cfg, metrics }
-    }
-}
-
-#[async_trait]
-impl ChainSource for YellowstoneSource {
-    async fn subscribe(
-        &self,
-    ) -> Result<BoxStream<'static, Result<ChainUpdate, IndexerError>>, IndexerError> {
-        let (tx, rx) = mpsc::channel(256);
-        let cfg = self.cfg.clone();
-        let metrics = self.metrics.clone();
-        tokio::spawn(async move {
-            let mut attempt = 0u32;
-            loop {
-                match run_session(&cfg, &metrics, tx.clone()).await {
-                    Ok(()) => break,
-                    Err(e) => {
-                        metrics.reconnect_count.inc();
-                        attempt = attempt.saturating_add(1);
-                        let backoff = bounded_backoff(attempt);
-                        warn!(error = %e, attempt, ?backoff, "yellowstone reconnect");
-                        tokio::time::sleep(backoff).await;
-                    }
-                }
-            }
-        });
-        Ok(Box::pin(tokio_stream::wrappers::ReceiverStream::new(rx)))
-    }
-}
-
-fn bounded_backoff(attempt: u32) -> Duration {
-    let base_ms = 500u64.saturating_mul(1u64 << attempt.min(6));
-    let capped = base_ms.min(30_000);
-    let jitter = rand::rng().random_range(0..capped / 4 + 1);
-    Duration::from_millis(capped + jitter)
-}
-
-async fn run_session(
-    cfg: &YellowstoneConfig,
-    metrics: &IndexerMetrics,
-    tx: mpsc::Sender<Result<ChainUpdate, IndexerError>>,
-) -> Result<(), IndexerError> {
-    info!("connecting yellowstone");
-    let mut builder = GeyserGrpcClient::build_from_shared(cfg.url.clone())
-        .map_err(|e| IndexerError::Source(e.to_string()))?
-        .connect_timeout(cfg.connect_timeout)
-        .timeout(Duration::from_secs(30));
-    if let Some(token) = &cfg.x_token {
-        builder = builder
-            .x_token(Some(token.clone()))
-            .map_err(|e| IndexerError::Source(e.to_string()))?;
-    }
-    if cfg.url.starts_with("https://") {
-        builder = builder
-            .tls_config(ClientTlsConfig::new().with_native_roots())
-            .map_err(|e| IndexerError::Source(e.to_string()))?;
-    }
-    let mut client = builder
-        .connect()
-        .await
-        .map_err(|e| IndexerError::Source(e.to_string()))?;
-
+/// Build a subscribe request for tests / production (no network I/O).
+pub fn build_subscribe_request(cfg: &YellowstoneConfig) -> SubscribeRequest {
     let mut accounts = HashMap::new();
     accounts.insert(
         "agentbond".into(),
@@ -169,7 +108,7 @@ async fn run_session(
             account_required: vec![],
         },
     );
-    let request = SubscribeRequest {
+    SubscribeRequest {
         accounts,
         slots,
         transactions,
@@ -180,21 +119,110 @@ async fn run_session(
         commitment: Some(CommitmentLevel::Processed as i32),
         accounts_data_slice: vec![],
         ping: None,
-        from_slot: None,
-    };
+        from_slot: cfg.from_slot,
+    }
+}
 
+pub struct YellowstoneSource {
+    cfg: YellowstoneConfig,
+    metrics: IndexerMetrics,
+}
+
+impl YellowstoneSource {
+    pub fn new(cfg: YellowstoneConfig, metrics: IndexerMetrics) -> Self {
+        Self { cfg, metrics }
+    }
+}
+
+#[async_trait]
+impl ChainSource for YellowstoneSource {
+    async fn subscribe(
+        &self,
+    ) -> Result<BoxStream<'static, Result<ChainUpdate, IndexerError>>, IndexerError> {
+        let (tx, rx) = mpsc::channel(256);
+        let cfg = self.cfg.clone();
+        let metrics = self.metrics.clone();
+        tokio::spawn(async move {
+            let mut attempt = 0u32;
+            loop {
+                if tx.is_closed() {
+                    break;
+                }
+                match run_session(&cfg, &metrics, &tx).await {
+                    Ok(()) => {
+                        // Successful session ended; reset backoff before reconnect if still open.
+                        attempt = 0;
+                        if tx.is_closed() {
+                            break;
+                        }
+                        metrics.reconnect_count.inc();
+                        tokio::time::sleep(Duration::from_millis(500)).await;
+                    }
+                    Err(e) => {
+                        if tx.is_closed() {
+                            break;
+                        }
+                        metrics.reconnect_count.inc();
+                        attempt = attempt.saturating_add(1);
+                        let backoff = bounded_backoff(attempt);
+                        warn!(error = %e, attempt, ?backoff, "yellowstone reconnect");
+                        tokio::time::sleep(backoff).await;
+                    }
+                }
+            }
+        });
+        Ok(Box::pin(tokio_stream::wrappers::ReceiverStream::new(rx)))
+    }
+}
+
+fn bounded_backoff(attempt: u32) -> Duration {
+    let base_ms = 500u64.saturating_mul(1u64 << attempt.min(6));
+    let capped = base_ms.min(30_000);
+    let jitter = rand::rng().random_range(0..capped / 4 + 1);
+    Duration::from_millis(capped + jitter)
+}
+
+async fn run_session(
+    cfg: &YellowstoneConfig,
+    metrics: &IndexerMetrics,
+    tx: &mpsc::Sender<Result<ChainUpdate, IndexerError>>,
+) -> Result<(), IndexerError> {
+    info!(from_slot = ?cfg.from_slot, "connecting yellowstone");
+    let mut builder = GeyserGrpcClient::build_from_shared(cfg.url.clone())
+        .map_err(|e| IndexerError::Source(e.to_string()))?
+        .connect_timeout(cfg.connect_timeout)
+        .timeout(Duration::from_secs(30));
+    if let Some(token) = &cfg.x_token {
+        builder = builder
+            .x_token(Some(token.clone()))
+            .map_err(|e| IndexerError::Source(e.to_string()))?;
+    }
+    if cfg.url.starts_with("https://") {
+        builder = builder
+            .tls_config(ClientTlsConfig::new().with_native_roots())
+            .map_err(|e| IndexerError::Source(e.to_string()))?;
+    }
+    let mut client = builder
+        .connect()
+        .await
+        .map_err(|e| IndexerError::Source(e.to_string()))?;
+
+    let request = build_subscribe_request(cfg);
     let (_sink, mut stream) = client
         .subscribe_with_request(Some(request))
         .await
         .map_err(|e| IndexerError::Source(e.to_string()))?;
 
     while let Some(msg) = stream.next().await {
+        if tx.is_closed() {
+            return Ok(());
+        }
         let update = msg.map_err(|e| IndexerError::Source(e.to_string()))?;
-        metrics.received_updates.inc();
+        // Counting happens in the engine to avoid double-count.
         let Some(oneof) = update.update_oneof else {
             continue;
         };
-        match oneof {
+        let chain = match oneof {
             UpdateOneof::Slot(slot) => {
                 let status = match slot.status() {
                     yellowstone_grpc_proto::geyser::SlotStatus::SlotFinalized => {
@@ -206,17 +234,17 @@ async fn run_session(
                     yellowstone_grpc_proto::geyser::SlotStatus::SlotDead => Commitment::Dead,
                     _ => Commitment::Processed,
                 };
-                let _ = tx
-                    .send(Ok(ChainUpdate::Slot(SlotUpdate {
-                        slot: slot.slot,
-                        parent_slot: slot.parent,
-                        status,
-                        block_time: None,
-                    })))
-                    .await;
+                Some(ChainUpdate::Slot(SlotUpdate {
+                    slot: slot.slot,
+                    parent_slot: slot.parent,
+                    status,
+                    block_time: None,
+                }))
             }
             UpdateOneof::Account(acc) => {
-                let Some(info) = acc.account else { continue };
+                let Some(info) = acc.account else {
+                    continue;
+                };
                 let address = Pubkey::try_from(info.pubkey.as_slice())
                     .map_err(|_| IndexerError::Decode("bad account pubkey".into()))?;
                 let owner = if info.owner.is_empty() {
@@ -239,17 +267,14 @@ async fn run_session(
                     deleted,
                     commitment: Commitment::Processed,
                 }) {
-                    Ok((raw, projection)) => {
-                        let _ = tx
-                            .send(Ok(ChainUpdate::Account(Box::new(AccountUpdate {
-                                raw,
-                                projection,
-                            }))))
-                            .await;
-                    }
+                    Ok((raw, projection)) => Some(ChainUpdate::Account(Box::new(AccountUpdate {
+                        raw,
+                        projection,
+                    }))),
                     Err(e) => {
                         metrics.decode_failures.inc();
                         warn!(error = %e, "account decode skipped");
+                        None
                     }
                 }
             }
@@ -270,25 +295,26 @@ async fn run_session(
                     &logs,
                     Commitment::Processed,
                 ) {
-                    Ok(events) => {
-                        if !events.is_empty() {
-                            metrics.decoded_events.inc_by(events.len() as u64);
-                            let _ = tx.send(Ok(ChainUpdate::Events(events))).await;
-                        }
-                    }
+                    Ok(events) if !events.is_empty() => Some(ChainUpdate::Events(events)),
+                    Ok(_) => None,
                     Err(e) => {
                         metrics.decode_failures.inc();
                         warn!(error = %e, "event decode skipped");
+                        None
                     }
                 }
             }
-            _ => {}
+            _ => None,
+        };
+        if let Some(update) = chain
+            && tx.send(Ok(update)).await.is_err()
+        {
+            return Ok(());
         }
     }
     Err(IndexerError::Source("yellowstone stream ended".into()))
 }
 
-// tokio-stream is used for ReceiverStream — add dependency or use manual stream.
 mod tokio_stream {
     pub mod wrappers {
         use std::pin::Pin;
@@ -313,5 +339,25 @@ mod tokio_stream {
                 self.inner.poll_recv(cx)
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use solana_pubkey::Pubkey;
+
+    #[test]
+    fn subscribe_request_includes_from_slot() {
+        let cfg = YellowstoneConfig {
+            url: "http://127.0.0.1:10000".into(),
+            x_token: None,
+            program_id: Pubkey::new_from_array([7u8; 32]),
+            connect_timeout: Duration::from_secs(1),
+            from_slot: Some(42),
+        };
+        let req = build_subscribe_request(&cfg);
+        assert_eq!(req.from_slot, Some(42));
+        assert!(req.accounts.contains_key("agentbond"));
     }
 }

@@ -106,11 +106,20 @@ fn map_db(err: agentbond_db::DbError) -> ApiError {
             ApiError::new(axum::http::StatusCode::NOT_FOUND, "not_found", m)
         }
         agentbond_db::DbError::Validation(m) => ApiError::bad_request(m),
-        agentbond_db::DbError::Sql(_) | agentbond_db::DbError::Migrate(_) => ApiError::new(
+        agentbond_db::DbError::Sql(_)
+        | agentbond_db::DbError::Migrate(_)
+        | agentbond_db::DbError::Migration(_) => ApiError::new(
             axum::http::StatusCode::SERVICE_UNAVAILABLE,
             "db_unavailable",
             "database unavailable",
         ),
-        other => ApiError::bad_request(other.to_string()),
+        agentbond_db::DbError::Conflict(m) => {
+            ApiError::new(axum::http::StatusCode::CONFLICT, "conflict", m)
+        }
+        _ => ApiError::new(
+            axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+            "internal_error",
+            "request failed",
+        ),
     }
 }

@@ -97,7 +97,7 @@ pub async fn invoke_paid_demo(
 
     let lease = match settlements.begin(&digest_key, binding.clone()).await? {
         BeginOutcome::Cached(cached) => return Ok(Ok(cached)),
-        BeginOutcome::Acquired(lease) => lease,
+        BeginOutcome::Acquired(lease) | BeginOutcome::RecoveredStale(lease) => lease,
     };
 
     let verify = match facilitator

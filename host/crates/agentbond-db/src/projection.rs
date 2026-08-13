@@ -1,8 +1,9 @@
 use chrono::{DateTime, TimeZone, Utc};
+use serde::{Deserialize, Serialize};
 use sqlx::{PgPool, Postgres, Transaction};
 
 use crate::error::DbError;
-use crate::util::u64_to_numeric;
+use crate::util::{i64_to_u64, u64_to_i64, u64_to_numeric};
 
 #[derive(Clone, Debug)]
 pub struct SlotUpdate {
@@ -27,6 +28,29 @@ impl Commitment {
             Self::Confirmed => "confirmed",
             Self::Finalized => "finalized",
             Self::Dead => "dead",
+        }
+    }
+
+    pub fn parse(s: &str) -> Result<Self, DbError> {
+        match s {
+            "processed" => Ok(Self::Processed),
+            "confirmed" => Ok(Self::Confirmed),
+            "finalized" => Ok(Self::Finalized),
+            "dead" => Ok(Self::Dead),
+            other => Err(DbError::Validation(format!("unknown commitment: {other}"))),
+        }
+    }
+
+    /// Returns whether `next` may replace `self`.
+    /// Downgrades from finalized/dead are rejected by callers as no-ops or conflicts.
+    fn can_upgrade(self, next: Self) -> bool {
+        if self == next {
+            return true;
+        }
+        match self {
+            Self::Finalized | Self::Dead => false,
+            Self::Confirmed => matches!(next, Self::Finalized | Self::Dead),
+            Self::Processed => matches!(next, Self::Confirmed | Self::Finalized | Self::Dead),
         }
     }
 }
@@ -58,7 +82,7 @@ pub struct RawProtocolEvent {
     pub commitment: Commitment,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct DecodedProjection {
     pub kind: ProjectionKind,
     pub address: [u8; 32],
@@ -67,7 +91,7 @@ pub struct DecodedProjection {
     pub payload: ProjectionPayload,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub enum ProjectionKind {
     Config,
     Provider,
@@ -77,7 +101,34 @@ pub enum ProjectionKind {
     Tombstone,
 }
 
-#[derive(Clone, Debug)]
+impl ProjectionKind {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Config => "Config",
+            Self::Provider => "Provider",
+            Self::ProviderBond => "ProviderBond",
+            Self::Job => "Job",
+            Self::Challenge => "Challenge",
+            Self::Tombstone => "Tombstone",
+        }
+    }
+
+    fn parse(s: &str) -> Result<Self, DbError> {
+        match s {
+            "Config" => Ok(Self::Config),
+            "Provider" => Ok(Self::Provider),
+            "ProviderBond" => Ok(Self::ProviderBond),
+            "Job" => Ok(Self::Job),
+            "Challenge" => Ok(Self::Challenge),
+            "Tombstone" => Ok(Self::Tombstone),
+            other => Err(DbError::Validation(format!(
+                "unknown projection kind: {other}"
+            ))),
+        }
+    }
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub enum ProjectionPayload {
     Config {
         paused: bool,
@@ -138,48 +189,116 @@ impl ProjectionRepo {
     }
 
     pub async fn upsert_slot(&self, update: &SlotUpdate) -> Result<(), DbError> {
-        sqlx::query(
-            "INSERT INTO indexer_slots (slot, parent_slot, status, block_time, updated_at)
-             VALUES ($1,$2,$3,$4,NOW())
-             ON CONFLICT (slot) DO UPDATE SET
-               parent_slot = EXCLUDED.parent_slot,
-               status = EXCLUDED.status,
-               block_time = COALESCE(EXCLUDED.block_time, indexer_slots.block_time),
-               updated_at = NOW()",
-        )
-        .bind(update.slot as i64)
-        .bind(update.parent_slot.map(|s| s as i64))
-        .bind(update.status.as_str())
-        .bind(
-            update
-                .block_time
-                .and_then(|t| Utc.timestamp_opt(t, 0).single()),
-        )
-        .execute(&self.pool)
-        .await?;
-        if update.status == Commitment::Dead {
-            self.cleanup_dead_slot(update.slot).await?;
+        let slot = u64_to_i64(update.slot)?;
+        let parent = match update.parent_slot {
+            Some(p) => Some(u64_to_i64(p)?),
+            None => None,
+        };
+        let block_time = update
+            .block_time
+            .and_then(|t| Utc.timestamp_opt(t, 0).single());
+
+        let mut tx = self.pool.begin().await?;
+        let existing: Option<(String,)> =
+            sqlx::query_as("SELECT status FROM indexer_slots WHERE slot = $1 FOR UPDATE")
+                .bind(slot)
+                .fetch_optional(&mut *tx)
+                .await?;
+
+        if let Some((status,)) = existing {
+            let current = Commitment::parse(&status)?;
+            if current == Commitment::Finalized && update.status == Commitment::Dead {
+                return Err(DbError::Conflict(
+                    "illegal slot status transition: finalized -> dead".into(),
+                ));
+            }
+            if current == Commitment::Dead && update.status == Commitment::Finalized {
+                return Err(DbError::Conflict(
+                    "illegal slot status transition: dead -> finalized".into(),
+                ));
+            }
+            // Ignore commitment downgrades and repeats that cannot upgrade (replay-safe).
+            if !current.can_upgrade(update.status) {
+                tx.commit().await?;
+                return Ok(());
+            }
+            sqlx::query(
+                "UPDATE indexer_slots
+                 SET parent_slot = $2,
+                     status = $3,
+                     block_time = COALESCE($4, block_time),
+                     updated_at = NOW()
+                 WHERE slot = $1",
+            )
+            .bind(slot)
+            .bind(parent)
+            .bind(update.status.as_str())
+            .bind(block_time)
+            .execute(&mut *tx)
+            .await?;
+        } else {
+            sqlx::query(
+                "INSERT INTO indexer_slots (slot, parent_slot, status, block_time, updated_at)
+                 VALUES ($1,$2,$3,$4,NOW())",
+            )
+            .bind(slot)
+            .bind(parent)
+            .bind(update.status.as_str())
+            .bind(block_time)
+            .execute(&mut *tx)
+            .await?;
         }
+
+        if update.status == Commitment::Dead {
+            cleanup_dead_slot_tx(&mut tx, update.slot).await?;
+        }
+
+        if update.status != Commitment::Dead {
+            sqlx::query(
+                "UPDATE indexer_checkpoints
+                 SET processed_slot = GREATEST(processed_slot, $1),
+                     updated_at = NOW()
+                 WHERE id = 1",
+            )
+            .bind(slot)
+            .execute(&mut *tx)
+            .await?;
+        }
+
+        tx.commit().await?;
         Ok(())
     }
 
-    async fn cleanup_dead_slot(&self, slot: u64) -> Result<(), DbError> {
-        sqlx::query(
-            "DELETE FROM raw_account_versions WHERE slot = $1 AND commitment <> 'finalized'",
-        )
-        .bind(slot as i64)
-        .execute(&self.pool)
-        .await?;
-        sqlx::query(
-            "DELETE FROM raw_protocol_events WHERE slot = $1 AND commitment <> 'finalized'",
-        )
-        .bind(slot as i64)
-        .execute(&self.pool)
-        .await?;
-        Ok(())
-    }
+    pub async fn insert_account_with_projection(
+        &self,
+        acc: &RawAccountVersion,
+        projection: Option<&DecodedProjection>,
+    ) -> Result<bool, DbError> {
+        let slot = u64_to_i64(acc.slot)?;
+        let write_version = u64_to_i64(acc.write_version)?;
+        let mut tx = self.pool.begin().await?;
 
-    pub async fn insert_account_version(&self, acc: &RawAccountVersion) -> Result<bool, DbError> {
+        let slot_status: Option<(String,)> =
+            sqlx::query_as("SELECT status FROM indexer_slots WHERE slot = $1")
+                .bind(slot)
+                .fetch_optional(&mut *tx)
+                .await?;
+        let slot_finalized = matches!(
+            slot_status.as_ref().map(|(s,)| s.as_str()),
+            Some("finalized")
+        );
+        let apply_now = slot_finalized || acc.commitment == Commitment::Finalized;
+        let commitment = if apply_now {
+            Commitment::Finalized
+        } else {
+            acc.commitment
+        };
+        if commitment == Commitment::Dead {
+            return Err(DbError::Validation(
+                "account commitment cannot be dead".into(),
+            ));
+        }
+
         let res = sqlx::query(
             "INSERT INTO raw_account_versions (
                 address, slot, write_version, owner, lamports, executable, data, deleted, commitment
@@ -187,17 +306,57 @@ impl ProjectionRepo {
              ON CONFLICT DO NOTHING",
         )
         .bind(acc.address.as_slice())
-        .bind(acc.slot as i64)
-        .bind(acc.write_version as i64)
+        .bind(slot)
+        .bind(write_version)
         .bind(acc.owner.as_ref().map(|o| o.as_slice()))
         .bind(u64_to_numeric(acc.lamports))
         .bind(acc.executable)
         .bind(acc.data.as_deref())
         .bind(acc.deleted)
-        .bind(acc.commitment.as_str())
-        .execute(&self.pool)
+        .bind(commitment.as_str())
+        .execute(&mut *tx)
         .await?;
-        Ok(res.rows_affected() == 1)
+
+        if res.rows_affected() == 0 {
+            tx.commit().await?;
+            return Ok(false);
+        }
+
+        if let Some(p) = projection {
+            let payload = serde_json::to_value(&p.payload)
+                .map_err(|e| DbError::Validation(format!("projection payload encode: {e}")))?;
+            sqlx::query(
+                "INSERT INTO staged_account_projections (
+                    address, slot, write_version, kind, payload
+                 ) VALUES ($1,$2,$3,$4,$5)
+                 ON CONFLICT (address, slot, write_version) DO UPDATE SET
+                    kind = EXCLUDED.kind,
+                    payload = EXCLUDED.payload",
+            )
+            .bind(p.address.as_slice())
+            .bind(u64_to_i64(p.slot)?)
+            .bind(u64_to_i64(p.write_version)?)
+            .bind(p.kind.as_str())
+            .bind(payload)
+            .execute(&mut *tx)
+            .await?;
+
+            if apply_now {
+                apply_projection(&mut tx, p).await?;
+                sqlx::query(
+                    "DELETE FROM staged_account_projections
+                     WHERE address = $1 AND slot = $2 AND write_version = $3",
+                )
+                .bind(p.address.as_slice())
+                .bind(u64_to_i64(p.slot)?)
+                .bind(u64_to_i64(p.write_version)?)
+                .execute(&mut *tx)
+                .await?;
+            }
+        }
+
+        tx.commit().await?;
+        Ok(true)
     }
 
     pub async fn insert_event(&self, ev: &RawProtocolEvent) -> Result<bool, DbError> {
@@ -205,6 +364,25 @@ impl ProjectionRepo {
             .timestamp_opt(ev.event_timestamp, 0)
             .single()
             .ok_or_else(|| DbError::Validation("bad event timestamp".into()))?;
+        let slot = u64_to_i64(ev.slot)?;
+        let slot_status: Option<(String,)> =
+            sqlx::query_as("SELECT status FROM indexer_slots WHERE slot = $1")
+                .bind(slot)
+                .fetch_optional(&self.pool)
+                .await?;
+        let commitment = if matches!(
+            slot_status.as_ref().map(|(s,)| s.as_str()),
+            Some("finalized")
+        ) {
+            Commitment::Finalized
+        } else {
+            ev.commitment
+        };
+        if commitment == Commitment::Dead {
+            return Err(DbError::Validation(
+                "event commitment cannot be dead".into(),
+            ));
+        }
         let res = sqlx::query(
             "INSERT INTO raw_protocol_events (
                 signature, event_index, slot, program_id, kind, subject, actor, amount,
@@ -214,43 +392,95 @@ impl ProjectionRepo {
         )
         .bind(&ev.signature)
         .bind(ev.event_index as i32)
-        .bind(ev.slot as i64)
+        .bind(slot)
         .bind(ev.program_id.as_slice())
         .bind(ev.kind as i16)
         .bind(ev.subject.as_slice())
         .bind(ev.actor.as_slice())
         .bind(u64_to_numeric(ev.amount))
         .bind(ts)
-        .bind(ev.commitment.as_str())
+        .bind(commitment.as_str())
         .execute(&self.pool)
         .await?;
         Ok(res.rows_affected() == 1)
     }
 
-    pub async fn finalize_slot(
-        &self,
-        slot: u64,
-        projections: &[DecodedProjection],
-    ) -> Result<(), DbError> {
+    pub async fn finalize_slot(&self, slot: u64) -> Result<u64, DbError> {
+        let slot_i = u64_to_i64(slot)?;
         let mut tx = self.pool.begin().await?;
-        self.assert_ancestry(&mut tx, slot).await?;
-        sqlx::query(
-            "UPDATE indexer_slots SET status = 'finalized', updated_at = NOW() WHERE slot = $1",
+
+        let row: Option<(String,)> =
+            sqlx::query_as("SELECT status FROM indexer_slots WHERE slot = $1 FOR UPDATE")
+                .bind(slot_i)
+                .fetch_optional(&mut *tx)
+                .await?;
+        let Some((status,)) = row else {
+            return Err(DbError::NotFound(format!("unknown slot {slot}")));
+        };
+        let status = Commitment::parse(&status)?;
+        if status == Commitment::Dead {
+            return Err(DbError::Conflict(format!(
+                "cannot finalize dead slot {slot}"
+            )));
+        }
+
+        // Ancestry is required the first time a slot becomes finalized.
+        if status != Commitment::Finalized {
+            assert_ancestry(&mut tx, slot).await?;
+        }
+
+        let staged_rows: Vec<(Vec<u8>, i64, i64, String, serde_json::Value)> = sqlx::query_as(
+            "SELECT address, slot, write_version, kind, payload
+             FROM staged_account_projections
+             WHERE slot = $1
+             ORDER BY address, write_version",
         )
-        .bind(slot as i64)
-        .execute(&mut *tx)
+        .bind(slot_i)
+        .fetch_all(&mut *tx)
         .await?;
+
+        let mut projections = Vec::with_capacity(staged_rows.len());
+        for (address, s, wv, kind, payload) in staged_rows {
+            let address = pk32(&address)?;
+            let kind = ProjectionKind::parse(&kind)?;
+            let payload: ProjectionPayload = serde_json::from_value(payload)
+                .map_err(|e| DbError::Validation(format!("staged payload decode: {e}")))?;
+            projections.push(DecodedProjection {
+                kind,
+                address,
+                slot: i64_to_u64(s)?,
+                write_version: i64_to_u64(wv)?,
+                payload,
+            });
+        }
+
+        if status != Commitment::Finalized {
+            sqlx::query(
+                "UPDATE indexer_slots SET status = 'finalized', updated_at = NOW() WHERE slot = $1",
+            )
+            .bind(slot_i)
+            .execute(&mut *tx)
+            .await?;
+        }
         sqlx::query("UPDATE raw_account_versions SET commitment = 'finalized' WHERE slot = $1")
-            .bind(slot as i64)
+            .bind(slot_i)
             .execute(&mut *tx)
             .await?;
         sqlx::query("UPDATE raw_protocol_events SET commitment = 'finalized' WHERE slot = $1")
-            .bind(slot as i64)
+            .bind(slot_i)
             .execute(&mut *tx)
             .await?;
-        for p in projections {
+
+        let applied = projections.len() as u64;
+        for p in &projections {
             apply_projection(&mut tx, p).await?;
         }
+
+        sqlx::query("DELETE FROM staged_account_projections WHERE slot = $1")
+            .bind(slot_i)
+            .execute(&mut *tx)
+            .await?;
+
         sqlx::query(
             "UPDATE indexer_checkpoints
              SET finalized_slot = GREATEST(finalized_slot, $1),
@@ -258,42 +488,12 @@ impl ProjectionRepo {
                  updated_at = NOW()
              WHERE id = 1",
         )
-        .bind(slot as i64)
+        .bind(slot_i)
         .execute(&mut *tx)
         .await?;
-        tx.commit().await?;
-        Ok(())
-    }
 
-    async fn assert_ancestry(
-        &self,
-        tx: &mut Transaction<'_, Postgres>,
-        slot: u64,
-    ) -> Result<(), DbError> {
-        let row: Option<(Option<i64>,)> =
-            sqlx::query_as("SELECT parent_slot FROM indexer_slots WHERE slot = $1")
-                .bind(slot as i64)
-                .fetch_optional(&mut **tx)
-                .await?;
-        let Some((parent,)) = row else {
-            return Ok(());
-        };
-        let Some(parent) = parent else {
-            return Ok(());
-        };
-        let parent_status: Option<(String,)> =
-            sqlx::query_as("SELECT status FROM indexer_slots WHERE slot = $1")
-                .bind(parent)
-                .fetch_optional(&mut **tx)
-                .await?;
-        if let Some((status,)) = parent_status
-            && status == "dead"
-        {
-            return Err(DbError::Conflict(
-                "conflicting finalized ancestry: parent is dead".into(),
-            ));
-        }
-        Ok(())
+        tx.commit().await?;
+        Ok(applied)
     }
 
     pub async fn checkpoint(&self) -> Result<(u64, u64), DbError> {
@@ -302,7 +502,7 @@ impl ProjectionRepo {
         )
         .fetch_one(&self.pool)
         .await?;
-        Ok((f as u64, p as u64))
+        Ok((i64_to_u64(f)?, i64_to_u64(p)?))
     }
 
     pub async fn record_gap(&self, from_slot: u64, to_slot: u64) -> Result<(), DbError> {
@@ -311,8 +511,28 @@ impl ProjectionRepo {
              VALUES ($1,$2,'open')
              ON CONFLICT (from_slot, to_slot) DO NOTHING",
         )
-        .bind(from_slot as i64)
-        .bind(to_slot as i64)
+        .bind(u64_to_i64(from_slot)?)
+        .bind(u64_to_i64(to_slot)?)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    pub async fn mark_gap_partial(
+        &self,
+        from_slot: u64,
+        to_slot: u64,
+        err: &str,
+    ) -> Result<(), DbError> {
+        let msg: String = err.chars().take(512).collect();
+        sqlx::query(
+            "UPDATE ingestion_gaps
+             SET status = 'partial', attempts = attempts + 1, last_error = $3, updated_at = NOW()
+             WHERE from_slot = $1 AND to_slot = $2",
+        )
+        .bind(u64_to_i64(from_slot)?)
+        .bind(u64_to_i64(to_slot)?)
+        .bind(msg)
         .execute(&self.pool)
         .await?;
         Ok(())
@@ -330,8 +550,8 @@ impl ProjectionRepo {
              SET status = 'failed', attempts = attempts + 1, last_error = $3, updated_at = NOW()
              WHERE from_slot = $1 AND to_slot = $2",
         )
-        .bind(from_slot as i64)
-        .bind(to_slot as i64)
+        .bind(u64_to_i64(from_slot)?)
+        .bind(u64_to_i64(to_slot)?)
         .bind(msg)
         .execute(&self.pool)
         .await?;
@@ -343,24 +563,87 @@ impl ProjectionRepo {
             "UPDATE ingestion_gaps SET status = 'repaired', updated_at = NOW()
              WHERE from_slot = $1 AND to_slot = $2",
         )
-        .bind(from_slot as i64)
-        .bind(to_slot as i64)
+        .bind(u64_to_i64(from_slot)?)
+        .bind(u64_to_i64(to_slot)?)
         .execute(&self.pool)
         .await?;
         Ok(())
     }
 
-    pub async fn open_gaps(&self) -> Result<Vec<(u64, u64)>, DbError> {
-        let rows: Vec<(i64, i64)> = sqlx::query_as(
-            "SELECT from_slot, to_slot FROM ingestion_gaps
-             WHERE status IN ('open','failed') ORDER BY from_slot ASC LIMIT 32",
+    pub async fn open_gaps(&self) -> Result<Vec<(u64, u64, String)>, DbError> {
+        let rows: Vec<(i64, i64, String)> = sqlx::query_as(
+            "SELECT from_slot, to_slot, status FROM ingestion_gaps
+             WHERE status IN ('partial','open','failed','repairing')
+             ORDER BY from_slot ASC LIMIT 32",
         )
         .fetch_all(&self.pool)
         .await?;
-        Ok(rows
-            .into_iter()
-            .map(|(a, b)| (a as u64, b as u64))
-            .collect())
+        let mut out = Vec::with_capacity(rows.len());
+        for (a, b, status) in rows {
+            out.push((i64_to_u64(a)?, i64_to_u64(b)?, status));
+        }
+        Ok(out)
+    }
+}
+
+async fn cleanup_dead_slot_tx(
+    tx: &mut Transaction<'_, Postgres>,
+    slot: u64,
+) -> Result<(), DbError> {
+    let slot = u64_to_i64(slot)?;
+    sqlx::query("DELETE FROM raw_account_versions WHERE slot = $1 AND commitment <> 'finalized'")
+        .bind(slot)
+        .execute(&mut **tx)
+        .await?;
+    sqlx::query("DELETE FROM raw_protocol_events WHERE slot = $1 AND commitment <> 'finalized'")
+        .bind(slot)
+        .execute(&mut **tx)
+        .await?;
+    sqlx::query("DELETE FROM staged_account_projections WHERE slot = $1")
+        .bind(slot)
+        .execute(&mut **tx)
+        .await?;
+    Ok(())
+}
+
+async fn assert_ancestry(tx: &mut Transaction<'_, Postgres>, slot: u64) -> Result<(), DbError> {
+    let mut current = slot;
+    let mut guarded = 0u32;
+    loop {
+        if guarded > 1_000_000 {
+            return Err(DbError::Conflict(
+                "conflicting finalized ancestry: parent chain too deep".into(),
+            ));
+        }
+        guarded = guarded.saturating_add(1);
+
+        let row: Option<(Option<i64>,)> =
+            sqlx::query_as("SELECT parent_slot FROM indexer_slots WHERE slot = $1")
+                .bind(u64_to_i64(current)?)
+                .fetch_optional(&mut **tx)
+                .await?;
+        let Some((parent,)) = row else {
+            return Ok(());
+        };
+        let Some(parent) = parent else {
+            return Ok(());
+        };
+        let parent_u = i64_to_u64(parent)?;
+        let parent_status: Option<(String,)> =
+            sqlx::query_as("SELECT status FROM indexer_slots WHERE slot = $1")
+                .bind(parent)
+                .fetch_optional(&mut **tx)
+                .await?;
+        if let Some((status,)) = parent_status {
+            if status == "dead" {
+                return Err(DbError::Conflict(
+                    "conflicting finalized ancestry: ancestor is dead".into(),
+                ));
+            }
+            current = parent_u;
+        } else {
+            return Ok(());
+        }
     }
 }
 
@@ -368,32 +651,32 @@ async fn apply_projection(
     tx: &mut Transaction<'_, Postgres>,
     p: &DecodedProjection,
 ) -> Result<(), DbError> {
-    // Reject stale writes: only apply if newer than existing as_of_slot.
+    let slot = u64_to_i64(p.slot)?;
     match &p.payload {
         ProjectionPayload::Tombstone => {
             sqlx::query("DELETE FROM proj_jobs WHERE address = $1 AND as_of_slot <= $2")
                 .bind(p.address.as_slice())
-                .bind(p.slot as i64)
+                .bind(slot)
                 .execute(&mut **tx)
                 .await?;
             sqlx::query("DELETE FROM proj_providers WHERE address = $1 AND as_of_slot <= $2")
                 .bind(p.address.as_slice())
-                .bind(p.slot as i64)
+                .bind(slot)
                 .execute(&mut **tx)
                 .await?;
             sqlx::query("DELETE FROM proj_provider_bonds WHERE address = $1 AND as_of_slot <= $2")
                 .bind(p.address.as_slice())
-                .bind(p.slot as i64)
+                .bind(slot)
                 .execute(&mut **tx)
                 .await?;
             sqlx::query("DELETE FROM proj_challenges WHERE address = $1 AND as_of_slot <= $2")
                 .bind(p.address.as_slice())
-                .bind(p.slot as i64)
+                .bind(slot)
                 .execute(&mut **tx)
                 .await?;
             sqlx::query("DELETE FROM proj_config WHERE address = $1 AND as_of_slot <= $2")
                 .bind(p.address.as_slice())
-                .bind(p.slot as i64)
+                .bind(slot)
                 .execute(&mut **tx)
                 .await?;
         }
@@ -426,7 +709,7 @@ async fn apply_projection(
                  WHERE proj_config.as_of_slot <= EXCLUDED.as_of_slot",
             )
             .bind(p.address.as_slice())
-            .bind(p.slot as i64)
+            .bind(slot)
             .bind(paused)
             .bind(admin.as_slice())
             .bind(genesis_hash.as_slice())
@@ -434,7 +717,7 @@ async fn apply_projection(
             .bind(token_program.as_slice())
             .bind(*mint_decimals as i16)
             .bind(u64_to_numeric(*min_provider_bond))
-            .bind(*challenge_duration_seconds as i64)
+            .bind(u64_to_i64(*challenge_duration_seconds)?)
             .execute(&mut **tx)
             .await?;
         }
@@ -455,7 +738,7 @@ async fn apply_projection(
                  WHERE proj_providers.as_of_slot <= EXCLUDED.as_of_slot",
             )
             .bind(p.address.as_slice())
-            .bind(p.slot as i64)
+            .bind(slot)
             .bind(authority.as_slice())
             .bind(status)
             .bind(*execution_key_count as i16)
@@ -481,7 +764,7 @@ async fn apply_projection(
                  WHERE proj_provider_bonds.as_of_slot <= EXCLUDED.as_of_slot",
             )
             .bind(p.address.as_slice())
-            .bind(p.slot as i64)
+            .bind(slot)
             .bind(authority.as_slice())
             .bind(mint.as_slice())
             .bind(u64_to_numeric(*deposited))
@@ -533,7 +816,7 @@ async fn apply_projection(
                  WHERE proj_jobs.as_of_slot <= EXCLUDED.as_of_slot",
             )
             .bind(p.address.as_slice())
-            .bind(p.slot as i64)
+            .bind(slot)
             .bind(buyer.as_slice())
             .bind(provider.as_slice())
             .bind(mint.as_slice())
@@ -576,7 +859,7 @@ async fn apply_projection(
                  WHERE proj_challenges.as_of_slot <= EXCLUDED.as_of_slot",
             )
             .bind(p.address.as_slice())
-            .bind(p.slot as i64)
+            .bind(slot)
             .bind(job.as_slice())
             .bind(buyer.as_slice())
             .bind(reason_hash.as_slice())
@@ -588,6 +871,10 @@ async fn apply_projection(
         }
     }
     Ok(())
+}
+
+fn pk32(bytes: &[u8]) -> Result<[u8; 32], DbError> {
+    <[u8; 32]>::try_from(bytes).map_err(|_| DbError::Validation("pubkey must be 32 bytes".into()))
 }
 
 fn ts(unix: i64) -> Result<DateTime<Utc>, DbError> {

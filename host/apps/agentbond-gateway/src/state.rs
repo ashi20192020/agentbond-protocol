@@ -4,6 +4,8 @@ use agentbond_app::{AppConfig, ServiceCatalog};
 use agentbond_payments::{ChallengeStore, FacilitatorClient, SettlementStore};
 use agentbond_sdk::ChainReader;
 
+use crate::metrics::PaymentMetrics;
+
 #[derive(Clone)]
 pub struct AppState {
     pub cfg: Arc<AppConfig>,
@@ -13,4 +15,5 @@ pub struct AppState {
     pub challenges: Arc<dyn ChallengeStore>,
     pub settlements: Arc<dyn SettlementStore>,
     pub db: Option<Arc<agentbond_db::Db>>,
+    pub payment_metrics: Arc<PaymentMetrics>,
 }

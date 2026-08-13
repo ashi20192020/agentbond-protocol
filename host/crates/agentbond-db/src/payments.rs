@@ -186,6 +186,8 @@ impl SettlementStore for PgSettlementStore {
         tx_digest: &str,
         binding: SettlementBinding,
     ) -> Result<BeginOutcome, PaymentError> {
+        validate_digest(tx_digest)?;
+        validate_binding(&binding)?;
         let mut tx = self
             .pool
             .begin()
@@ -211,7 +213,8 @@ impl SettlementStore for PgSettlementStore {
             if row_binding != binding {
                 return Err(PaymentError::BindingMismatch);
             }
-            match row.state.as_str() {
+            let prior = row.state.clone();
+            match prior.as_str() {
                 "settled" => {
                     let body = row
                         .result_body
@@ -265,7 +268,12 @@ impl SettlementStore for PgSettlementStore {
             tx.commit()
                 .await
                 .map_err(|e| PaymentError::Internal(e.to_string()))?;
-            return Ok(BeginOutcome::Acquired(LeaseToken(lease)));
+            let token = LeaseToken(lease);
+            return Ok(if prior == "settling" {
+                BeginOutcome::RecoveredStale(token)
+            } else {
+                BeginOutcome::Acquired(token)
+            });
         }
 
         let lease = Uuid::new_v4();
@@ -363,6 +371,30 @@ impl SettlementStore for PgSettlementStore {
         }
         Ok(())
     }
+}
+
+fn validate_digest(tx_digest: &str) -> Result<(), PaymentError> {
+    if tx_digest.len() != 64 || !tx_digest.chars().all(|c| c.is_ascii_hexdigit()) {
+        return Err(PaymentError::Internal("invalid tx digest".into()));
+    }
+    Ok(())
+}
+
+fn validate_binding(binding: &SettlementBinding) -> Result<(), PaymentError> {
+    if binding.input_digest.len() != 64
+        || !binding.input_digest.chars().all(|c| c.is_ascii_hexdigit())
+    {
+        return Err(PaymentError::Internal("invalid input digest".into()));
+    }
+    if binding.challenge_memo.len() != 32
+        || !binding
+            .challenge_memo
+            .chars()
+            .all(|c| c.is_ascii_hexdigit())
+    {
+        return Err(PaymentError::Internal("invalid challenge memo".into()));
+    }
+    Ok(())
 }
 
 #[derive(sqlx::FromRow)]

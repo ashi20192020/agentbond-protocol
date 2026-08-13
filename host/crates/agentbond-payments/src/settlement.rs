@@ -95,7 +95,7 @@ impl SettlementStore for MemorySettlementStore {
                             started: Instant::now(),
                         },
                     );
-                    return Ok(BeginOutcome::Acquired(lease));
+                    return Ok(BeginOutcome::RecoveredStale(lease));
                 }
                 Err(PaymentError::SettlementInProgress)
             }

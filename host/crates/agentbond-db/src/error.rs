@@ -14,6 +14,8 @@ pub enum DbError {
     Conflict(String),
     #[error("validation: {0}")]
     Validation(String),
+    #[error("migration: {0}")]
+    Migration(String),
     #[error(transparent)]
     Payment(#[from] agentbond_payments::PaymentError),
 }

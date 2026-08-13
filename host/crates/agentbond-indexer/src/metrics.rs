@@ -15,9 +15,6 @@ pub struct IndexerMetrics {
     pub detected_gaps: IntCounter,
     pub reconnect_count: IntCounter,
     pub database_errors: IntCounter,
-    pub settlement_lease_acquisition: IntCounter,
-    pub settlement_cache_hit: IntCounter,
-    pub settlement_recovery: IntCounter,
 }
 
 impl IndexerMetrics {
@@ -47,18 +44,6 @@ impl IndexerMetrics {
             IntCounter::with_opts(opts!("agentbond_reconnect_count", "reconnect count"))?;
         let database_errors =
             IntCounter::with_opts(opts!("agentbond_database_errors", "database errors"))?;
-        let settlement_lease_acquisition = IntCounter::with_opts(opts!(
-            "agentbond_settlement_lease_acquisition",
-            "settlement leases"
-        ))?;
-        let settlement_cache_hit = IntCounter::with_opts(opts!(
-            "agentbond_settlement_cache_hit",
-            "settlement cache hits"
-        ))?;
-        let settlement_recovery = IntCounter::with_opts(opts!(
-            "agentbond_settlement_recovery",
-            "settlement recoveries"
-        ))?;
 
         registry.register(Box::new(received_updates.clone()))?;
         registry.register(Box::new(decoded_events.clone()))?;
@@ -70,9 +55,6 @@ impl IndexerMetrics {
         registry.register(Box::new(detected_gaps.clone()))?;
         registry.register(Box::new(reconnect_count.clone()))?;
         registry.register(Box::new(database_errors.clone()))?;
-        registry.register(Box::new(settlement_lease_acquisition.clone()))?;
-        registry.register(Box::new(settlement_cache_hit.clone()))?;
-        registry.register(Box::new(settlement_recovery.clone()))?;
 
         Ok(Self {
             registry: Arc::new(registry),
@@ -86,17 +68,14 @@ impl IndexerMetrics {
             detected_gaps,
             reconnect_count,
             database_errors,
-            settlement_lease_acquisition,
-            settlement_cache_hit,
-            settlement_recovery,
         })
     }
 
-    pub fn render(&self) -> String {
+    pub fn render(&self) -> Result<String, prometheus::Error> {
         let encoder = TextEncoder::new();
         let metric_families = self.registry.gather();
         let mut buffer = Vec::new();
-        let _ = encoder.encode(&metric_families, &mut buffer);
-        String::from_utf8_lossy(&buffer).into_owned()
+        encoder.encode(&metric_families, &mut buffer)?;
+        String::from_utf8(buffer).map_err(|_| prometheus::Error::Msg("utf8".into()))
     }
 }

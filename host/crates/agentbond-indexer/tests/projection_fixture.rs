@@ -24,6 +24,15 @@ fn event_b64(kind: ProtocolEventKind, amount: u64) -> String {
     Engine::encode(&base64::engine::general_purpose::STANDARD, event.encode())
 }
 
+fn framed_logs(program: &str, kinds: &[(ProtocolEventKind, u64)]) -> Vec<String> {
+    let mut logs = vec![format!("Program {program} invoke [1]")];
+    for (kind, amount) in kinds {
+        logs.push(format!("Program data: {}", event_b64(*kind, *amount)));
+    }
+    logs.push(format!("Program {program} success"));
+    logs
+}
+
 async fn db() -> (std::fs::File, Arc<Db>) {
     let lock = pg_test_lock().expect("pg lock");
     let db = Arc::new(
@@ -41,14 +50,18 @@ async fn fixture_replay_finalizes_and_is_idempotent() {
     let (_lock, db) = db().await;
     let metrics = IndexerMetrics::new().expect("metrics");
     let program = agentbond_sdk::program_id().to_string();
+    let logs = framed_logs(
+        &program,
+        &[
+            (ProtocolEventKind::JobCreated, 5),
+            (ProtocolEventKind::JobFunded, 5),
+        ],
+    );
     let json = serde_json::json!({
         "program_id": program,
         "updates": [
             {"type":"slot","slot":10,"parent_slot":null,"status":"processed","block_time":1700000000},
-            {"type":"transaction","signature":"B".repeat(64),"slot":10,"commitment":"processed","logs":[
-                format!("Program data: {}", event_b64(ProtocolEventKind::JobCreated, 5)),
-                format!("Program data: {}", event_b64(ProtocolEventKind::JobFunded, 5))
-            ]},
+            {"type":"transaction","signature":"B".repeat(64),"slot":10,"commitment":"processed","logs": logs},
             {"type":"slot","slot":10,"parent_slot":null,"status":"finalized","block_time":1700000000},
             {"type":"slot","slot":12,"parent_slot":10,"status":"processed","block_time":1700000002},
             {"type":"slot","slot":12,"parent_slot":10,"status":"finalized","block_time":1700000002}
@@ -68,6 +81,16 @@ async fn fixture_replay_finalizes_and_is_idempotent() {
     let reads = ReadRepo::new(db.pool().clone());
     let status = reads.status().await.expect("status");
     assert_eq!(status.as_of_slot, finalized.to_string());
+    let rendered = metrics.render().expect("metrics encode");
+    assert!(rendered.contains("agentbond_checkpoint_slot"));
+    assert!(
+        metrics.decoded_events.get() >= 2,
+        "decode counters must move during fixture replay"
+    );
+    assert_eq!(
+        metrics.checkpoint_slot.get(),
+        i64::try_from(finalized).expect("slot fits i64")
+    );
 
     let gap_source = FixtureSource::from_json(
         &serde_json::json!({
@@ -85,24 +108,86 @@ async fn fixture_replay_finalizes_and_is_idempotent() {
     engine2.run_source(&gap_source).await.expect("gap run");
     let gaps = repo.open_gaps().await.expect("gaps");
     assert!(
-        gaps.iter().any(|(f, t)| *f == 16 && *t == 19),
+        gaps.iter().any(|(f, t, _)| *f == 16 && *t == 19),
         "expected gap 16..=19, got {gaps:?}"
     );
 }
 
 #[tokio::test]
-async fn processed_accounts_are_not_public_until_finalized() {
+async fn processed_projection_survives_engine_restart() {
     let (_lock, db) = db().await;
     let metrics = IndexerMetrics::new().expect("metrics");
     let program = agentbond_sdk::program_id().to_string();
-    // only processed slot + account; no finalize
+    let job = bs58::encode([9u8; 32]).into_string();
+    // Minimal job account bytes (Funded) owned by program — address not PDA-checked.
+    let job_b64 = {
+        let mut out = vec![0u8; 253];
+        out[0] = 4;
+        out[1] = 1;
+        out[2] = 255;
+        out[3] = 1;
+        out[4..36].copy_from_slice(&[1u8; 32]);
+        out[36..68].copy_from_slice(&[2u8; 32]);
+        out[68..100].copy_from_slice(&[3u8; 32]);
+        out[100..132].copy_from_slice(&[4u8; 32]);
+        out[132..140].copy_from_slice(&1000u64.to_le_bytes());
+        out[140..148].copy_from_slice(&7u64.to_le_bytes());
+        for (off, v) in [
+            (148, 1_700_000_100i64),
+            (156, 1_700_000_200),
+            (164, 1_700_000_300),
+            (172, 1_700_000_400),
+        ] {
+            out[off..off + 8].copy_from_slice(&v.to_le_bytes());
+        }
+        out[252] = 6;
+        Engine::encode(&base64::engine::general_purpose::STANDARD, out)
+    };
+    let processed = serde_json::json!({
+        "program_id": program,
+        "updates": [
+            {"type":"slot","slot":50,"parent_slot":null,"status":"processed","block_time":1},
+            {"type":"account","address": job, "slot":50,"write_version":1,"owner": program,
+             "lamports":1,"deleted":false,"commitment":"processed","data_base64": job_b64}
+        ]
+    });
+    IndexerEngine::new(db.clone(), metrics.clone())
+        .run_source(&FixtureSource::from_json(&processed.to_string()).expect("p"))
+        .await
+        .expect("processed ingest");
+
+    // New engine instance before finalization.
+    let finalize = serde_json::json!({
+        "program_id": program,
+        "updates": [
+            {"type":"slot","slot":50,"parent_slot":null,"status":"finalized","block_time":1}
+        ]
+    });
+    IndexerEngine::new(db.clone(), metrics)
+        .run_source(&FixtureSource::from_json(&finalize.to_string()).expect("f"))
+        .await
+        .expect("finalize after restart");
+
+    let reads = ReadRepo::new(db.pool().clone());
+    let jobs = reads
+        .list_jobs(20, None, None, None, None)
+        .await
+        .expect("jobs");
+    assert_eq!(jobs.items.len(), 1);
+    assert_eq!(jobs.items[0].address, job);
+}
+
+#[tokio::test]
+async fn processed_events_are_not_public_until_finalized() {
+    let (_lock, db) = db().await;
+    let metrics = IndexerMetrics::new().expect("metrics");
+    let program = agentbond_sdk::program_id().to_string();
+    let logs = framed_logs(&program, &[(ProtocolEventKind::JobCreated, u64::MAX)]);
     let json = serde_json::json!({
         "program_id": program,
         "updates": [
             {"type":"slot","slot":100,"parent_slot":null,"status":"processed","block_time":1},
-            {"type":"transaction","signature":"C".repeat(64),"slot":100,"commitment":"processed","logs":[
-                format!("Program data: {}", event_b64(ProtocolEventKind::JobCreated, u64::MAX))
-            ]}
+            {"type":"transaction","signature":"C".repeat(64),"slot":100,"commitment":"processed","logs": logs}
         ]
     });
     IndexerEngine::new(db.clone(), metrics)
@@ -122,13 +207,12 @@ async fn dead_fork_cleans_non_finalized_staging() {
     let (_lock, db) = db().await;
     let metrics = IndexerMetrics::new().expect("metrics");
     let program = agentbond_sdk::program_id().to_string();
+    let logs = framed_logs(&program, &[(ProtocolEventKind::JobCreated, 1)]);
     let json = serde_json::json!({
         "program_id": program,
         "updates": [
             {"type":"slot","slot":200,"parent_slot":null,"status":"processed","block_time":1},
-            {"type":"transaction","signature":"D".repeat(64),"slot":200,"commitment":"processed","logs":[
-                format!("Program data: {}", event_b64(ProtocolEventKind::JobCreated, 1))
-            ]},
+            {"type":"transaction","signature":"D".repeat(64),"slot":200,"commitment":"processed","logs": logs},
             {"type":"slot","slot":200,"parent_slot":null,"status":"dead","block_time":1}
         ]
     });
@@ -145,11 +229,47 @@ async fn dead_fork_cleans_non_finalized_staging() {
 }
 
 #[tokio::test]
-async fn conflicting_finalized_ancestry_is_hard_error() {
+async fn finalized_cannot_downgrade_and_conflicting_ancestry() {
     let (_lock, db) = db().await;
     let repo = ProjectionRepo::new(db.pool().clone());
     repo.upsert_slot(&SlotUpdate {
         slot: 300,
+        parent_slot: None,
+        status: Commitment::Finalized,
+        block_time: None,
+    })
+    .await
+    .expect("finalized");
+    repo.upsert_slot(&SlotUpdate {
+        slot: 300,
+        parent_slot: None,
+        status: Commitment::Processed,
+        block_time: None,
+    })
+    .await
+    .expect("downgrade ignored");
+    let status: (String,) = sqlx::query_as("SELECT status FROM indexer_slots WHERE slot = 300")
+        .fetch_one(db.pool())
+        .await
+        .expect("status");
+    assert_eq!(
+        status.0, "finalized",
+        "finalized must not downgrade to processed"
+    );
+
+    let err = repo
+        .upsert_slot(&SlotUpdate {
+            slot: 300,
+            parent_slot: None,
+            status: Commitment::Dead,
+            block_time: None,
+        })
+        .await
+        .expect_err("finalized -> dead");
+    assert!(err.to_string().contains("finalized"));
+
+    repo.upsert_slot(&SlotUpdate {
+        slot: 310,
         parent_slot: None,
         status: Commitment::Dead,
         block_time: None,
@@ -157,15 +277,39 @@ async fn conflicting_finalized_ancestry_is_hard_error() {
     .await
     .expect("dead parent");
     repo.upsert_slot(&SlotUpdate {
-        slot: 301,
-        parent_slot: Some(300),
+        slot: 311,
+        parent_slot: Some(310),
         status: Commitment::Processed,
         block_time: None,
     })
     .await
     .expect("child");
-    let err = repo.finalize_slot(301, &[]).await.expect_err("conflict");
+    let err = repo.finalize_slot(311).await.expect_err("conflict");
     assert!(err.to_string().contains("ancestry") || err.to_string().contains("dead"));
+}
+
+#[tokio::test]
+async fn out_of_order_slots_do_not_create_false_gaps() {
+    let (_lock, db) = db().await;
+    let metrics = IndexerMetrics::new().expect("metrics");
+    let program = agentbond_sdk::program_id().to_string();
+    let json = serde_json::json!({
+        "program_id": program,
+        "updates": [
+            {"type":"slot","slot":20,"parent_slot":null,"status":"processed","block_time":1},
+            {"type":"slot","slot":18,"parent_slot":null,"status":"processed","block_time":1},
+            {"type":"slot","slot":20,"parent_slot":null,"status":"confirmed","block_time":1}
+        ]
+    });
+    IndexerEngine::new(db.clone(), metrics)
+        .run_source(&FixtureSource::from_json(&json.to_string()).expect("f"))
+        .await
+        .expect("run");
+    let gaps = ProjectionRepo::new(db.pool().clone())
+        .open_gaps()
+        .await
+        .expect("gaps");
+    assert!(gaps.is_empty(), "false gaps: {gaps:?}");
 }
 
 #[tokio::test]
@@ -174,7 +318,6 @@ async fn successful_and_failed_backfill_are_recorded() {
     let metrics = IndexerMetrics::new().expect("metrics");
     let program = agentbond_sdk::program_id().to_string();
 
-    // failed backfill (NullBackfill default)
     let fail_src = FixtureSource::from_json(
         &serde_json::json!({
             "program_id": program,
@@ -192,9 +335,11 @@ async fn successful_and_failed_backfill_are_recorded() {
         .expect("fail run");
     let repo = ProjectionRepo::new(db.pool().clone());
     let open = repo.open_gaps().await.expect("gaps");
-    assert!(open.iter().any(|(f, t)| *f == 401 && *t == 402));
+    assert!(
+        open.iter()
+            .any(|(f, t, s)| *f == 401 && *t == 402 && s != "repaired")
+    );
 
-    // successful backfill with MapBackfill
     let mut map = HashMap::new();
     map.insert(
         501,
@@ -226,14 +371,19 @@ async fn successful_and_failed_backfill_are_recorded() {
     )
     .expect("ok fixture");
     IndexerEngine::new(db.clone(), metrics)
-        .with_backfill(Arc::new(MapBackfill { slots: map }))
+        .with_backfill(Arc::new(MapBackfill {
+            slots: map,
+            accounts_reconciled: false,
+        }))
         .run_source(&ok_src)
         .await
         .expect("ok run");
     let open2 = repo.open_gaps().await.expect("gaps2");
     assert!(
-        !open2.iter().any(|(f, t)| *f == 501 && *t == 502),
-        "repaired gap should leave open/failed set"
+        open2
+            .iter()
+            .any(|(f, t, s)| *f == 501 && *t == 502 && s == "partial"),
+        "expected partial gap, got {open2:?}"
     );
     let _ = NullBackfill;
 }

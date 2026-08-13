@@ -2,6 +2,7 @@
 
 pub mod error;
 pub mod index_routes;
+pub mod metrics;
 pub mod state;
 
 use std::sync::Arc;
@@ -41,14 +42,22 @@ pub fn test_state(
     reader: Arc<dyn ChainReader>,
     facilitator: Arc<dyn agentbond_payments::FacilitatorClient>,
 ) -> AppState {
+    let payment_metrics =
+        Arc::new(metrics::PaymentMetrics::new().expect("payment metrics for tests"));
+    let settlements: Arc<dyn agentbond_payments::SettlementStore> =
+        Arc::new(metrics::MeteredSettlementStore::new(
+            Arc::new(agentbond_payments::MemorySettlementStore::new()),
+            payment_metrics.clone(),
+        ));
     AppState {
         cfg: Arc::new(cfg),
         catalog: Arc::new(catalog),
         reader,
         facilitator,
         challenges: Arc::new(agentbond_payments::MemoryChallengeStore::new()),
-        settlements: Arc::new(agentbond_payments::MemorySettlementStore::new()),
+        settlements,
         db: None,
+        payment_metrics,
     }
 }
 
@@ -60,14 +69,22 @@ pub fn test_state_with_db(
     facilitator: Arc<dyn agentbond_payments::FacilitatorClient>,
     db: Arc<agentbond_db::Db>,
 ) -> AppState {
+    let payment_metrics =
+        Arc::new(metrics::PaymentMetrics::new().expect("payment metrics for tests"));
+    let settlements: Arc<dyn agentbond_payments::SettlementStore> =
+        Arc::new(metrics::MeteredSettlementStore::new(
+            Arc::new(agentbond_db::PgSettlementStore::new(db.pool().clone())),
+            payment_metrics.clone(),
+        ));
     AppState {
         cfg: Arc::new(cfg),
         catalog: Arc::new(catalog),
         reader,
         facilitator,
         challenges: Arc::new(agentbond_db::PgChallengeStore::new(db.pool().clone())),
-        settlements: Arc::new(agentbond_db::PgSettlementStore::new(db.pool().clone())),
+        settlements,
         db: Some(db),
+        payment_metrics,
     }
 }
 
@@ -78,6 +95,7 @@ pub fn router(state: AppState, max_body: usize, timeout: Duration) -> Router {
     Router::new()
         .route("/health/live", get(live))
         .route("/health/ready", get(ready))
+        .route("/metrics", get(metrics_endpoint))
         .route("/v1/services", get(services))
         .route("/v1/services/{service_id}", get(service))
         .route("/v1/providers/{address}", get(provider))
@@ -149,11 +167,28 @@ async fn live() -> StatusCode {
     StatusCode::OK
 }
 
+async fn metrics_endpoint(State(state): State<AppState>) -> ApiResult<axum::response::Response> {
+    let body = state.payment_metrics.render().map_err(|e| {
+        ApiError::new(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "metrics_error",
+            e.to_string(),
+        )
+    })?;
+    let mut response = axum::response::Response::new(axum::body::Body::from(body));
+    *response.status_mut() = StatusCode::OK;
+    response.headers_mut().insert(
+        axum::http::header::CONTENT_TYPE,
+        HeaderValue::from_static("text/plain; version=0.0.4; charset=utf-8"),
+    );
+    Ok(response)
+}
+
 async fn ready(State(state): State<AppState>) -> ApiResult<Json<Value>> {
     let rpc = state.reader.ready().await;
     let fac = state.facilitator.ready().await;
     let db_ok = match &state.db {
-        Some(db) => db.health().await.is_ok(),
+        Some(db) => db.health().await.is_ok() && db.migrations_status().await.is_ok(),
         None => true,
     };
     let ok = rpc.is_ok() && fac.is_ok() && db_ok;

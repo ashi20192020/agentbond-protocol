@@ -10,16 +10,18 @@ This repository is early. It is not production-ready and has not been audited.
 
 Milestone 4 adds the durable read and recovery layer on top of Milestones 1–3:
 
-- PostgreSQL migrations and repositories (`agentbond-db`)
-- Yellowstone gRPC + fixture indexer (`agentbond-indexer`, `agentbond-indexer` CLI)
-- Fork-safe finalized projections (public reads are finalized-only)
+- PostgreSQL migrations and repositories (`agentbond-db`); only `agentbond-indexer migrate` applies them
+- Yellowstone gRPC + fixture indexer with checkpoint `from_slot` resume
+- Invoke-stack scoped protocol event decoding (CPI noise ignored)
+- Durable staged account projections; public reads are finalized-only
+- Honest gap repair: events via bounded `getBlock`, accounts stay `partial` until reconciled
 - Persistent x402 challenge and settlement recovery (memory only with explicit mock mode)
-- Indexed gateway APIs under `/v1/index/*`
-- Metrics/readiness for the indexer, Compose PostgreSQL demo, CI, and portfolio docs
+- Indexed gateway APIs under `/v1/index/*` with strict query validation
+- Separate indexer and gateway `/metrics` surfaces, Compose PostgreSQL demo, CI, and portfolio docs
 
 Earlier milestones remain: shared types, Pinocchio escrow program, SDK/CLI/gateway/MCP/simulator, and the narrow unofficial x402 adapter.
 
-The project is **not production-ready** and has **not been audited**. Indexed data is a read model and cannot move funds. Receipts prove authorship, not correctness. Persistent local settlement does not guarantee global exactly-once facilitator behavior. SAS, MPP, Token-2022, confidential transfers, TEE verification, and live deployment remain out of scope.
+The project is **not production-ready** and has **not been audited**. Indexed data is a read model and cannot move funds. Receipts prove authorship, not correctness. Persistent local settlement does not guarantee global exactly-once facilitator behavior. Gap repair does not claim full account coverage without reconciliation. SAS, MPP, Token-2022, confidential transfers, TEE verification, and live deployment remain out of scope.
 
 ## Workspaces and toolchains
 
@@ -285,7 +287,7 @@ cargo run --manifest-path host/Cargo.toml -p agentbond-indexer-app --bin agentbo
 cargo run --manifest-path host/Cargo.toml -p agentbond-indexer-app --bin agentbond-indexer -- replay --fixture host/fixtures/indexer/lifecycle.json
 ```
 
-Public projections are finalized-only. Processed updates may stage raw data. The database never authorizes token movement or signing. Yellowstone client packages used here are Apache-2.0; see [docs/third-party-licenses.md](docs/third-party-licenses.md).
+Public projections are finalized-only. Processed updates stage raw rows and decoded account projections in PostgreSQL so a restart before finalization loses nothing. Gateway and indexer `run`/`replay` verify migration versions and checksums; they do not apply migrations. The database never authorizes token movement or signing. Yellowstone client packages used here are Apache-2.0; see [docs/third-party-licenses.md](docs/third-party-licenses.md).
 
 Local PostgreSQL only (pin `postgres:16.6-alpine`):
 
@@ -322,13 +324,14 @@ Build the SBF binary before LiteSVM program tests or the simulator so they can l
 
 CI also runs PostgreSQL integration tests, fixture replay, and an SBF size budget of 180,000 bytes. No workflow step contacts mainnet, devnet, Yellowstone, or a live facilitator.
 
-Current offline verification counts (no internet):
+Current offline verification counts (local, pinned `postgres:16.6-alpine` on compose port 5433):
 
 - Root workspace: **127** tests passed
-- Host workspace: **61** tests passed
+- Host workspace: **87** tests passed
 - Simulator: all **6** scenarios passed
+- `target/deploy/agentbond.so`: **151,480** bytes (budget 180,000)
 
-Honest remaining limitations: no live-cluster Yellowstone suite in CI; the x402 adapter is not an official facilitator SDK; SAS/MPP/Token-2022/TEE/deployment remain future work.
+Honest remaining limitations: no live-cluster Yellowstone suite in CI; gap repair marks `partial` when account reconciliation is incomplete; the x402 adapter is not an official facilitator SDK; SAS/MPP/Token-2022/TEE/deployment remain future work.
 
 ## Program binary size
 

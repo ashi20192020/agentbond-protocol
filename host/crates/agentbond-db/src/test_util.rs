@@ -37,6 +37,7 @@ pub async fn reset_public_tables(db: &Db) -> Result<(), DbError> {
             proj_provider_bonds,
             proj_providers,
             proj_config,
+            staged_account_projections,
             raw_protocol_events,
             raw_account_versions,
             ingestion_gaps,

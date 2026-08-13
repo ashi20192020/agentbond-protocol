@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::time::Duration;
 
 use sqlx::postgres::{PgPool, PgPoolOptions};
@@ -34,8 +35,18 @@ impl Db {
         Ok(())
     }
 
+    /// True only when every embedded migration version is present, successful, and checksum-matched.
     pub async fn migrations_current(&self) -> Result<bool, DbError> {
-        // After migrate(), version table exists. Empty DB before migrate is not current.
+        match self.migrations_status().await {
+            Ok(()) => Ok(true),
+            Err(DbError::Migration(_)) => Ok(false),
+            Err(e) => Err(e),
+        }
+    }
+
+    /// Verify embedded migrations are applied with matching checksums.
+    pub async fn migrations_status(&self) -> Result<(), DbError> {
+        let migrator = sqlx::migrate!("./migrations");
         let row: (i64,) = sqlx::query_as(
             "SELECT COUNT(*)::bigint FROM information_schema.tables \
              WHERE table_schema = 'public' AND table_name = '_sqlx_migrations'",
@@ -43,25 +54,48 @@ impl Db {
         .fetch_one(&self.pool)
         .await?;
         if row.0 == 0 {
-            return Ok(false);
+            return Err(DbError::Migration(
+                "migrations table missing; run agentbond-indexer migrate".into(),
+            ));
         }
-        let dirty: (i64,) =
-            sqlx::query_as("SELECT COUNT(*)::bigint FROM _sqlx_migrations WHERE success = false")
-                .fetch_one(&self.pool)
-                .await?;
-        Ok(dirty.0 == 0)
+        let applied: Vec<(i64, bool, Vec<u8>)> = sqlx::query_as(
+            "SELECT version, success, checksum FROM _sqlx_migrations ORDER BY version",
+        )
+        .fetch_all(&self.pool)
+        .await?;
+        let applied_map: HashMap<i64, (bool, Vec<u8>)> = applied
+            .into_iter()
+            .map(|(v, ok, ck)| (v, (ok, ck)))
+            .collect();
+        for m in migrator.iter() {
+            let version = m.version;
+            let Some((success, checksum)) = applied_map.get(&version) else {
+                return Err(DbError::Migration(format!(
+                    "pending migration version {version}; run agentbond-indexer migrate"
+                )));
+            };
+            if !*success {
+                return Err(DbError::Migration(format!(
+                    "failed migration version {version}; run agentbond-indexer migrate after repair"
+                )));
+            }
+            let expected: &[u8] = m.checksum.as_ref();
+            if checksum.as_slice() != expected {
+                return Err(DbError::Migration(format!(
+                    "checksum mismatch for migration version {version}"
+                )));
+            }
+        }
+        Ok(())
     }
 }
 
 fn reject_credential_logging(database_url: &str) -> Result<(), DbError> {
     let parsed = Url::parse(database_url).map_err(|e| DbError::Config(e.to_string()))?;
-    if !parsed.username().is_empty() || parsed.password().is_some() {
-        // Credentials are allowed in DATABASE_URL but must never be logged by callers.
-        // Reject only clearly malformed schemes.
-    }
     if parsed.scheme() != "postgres" && parsed.scheme() != "postgresql" {
         return Err(DbError::Config("DATABASE_URL must be postgres".into()));
     }
+    let _ = parsed.username();
     Ok(())
 }
 

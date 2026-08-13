@@ -13,7 +13,9 @@ use solana_pubkey::Pubkey;
 use crate::error::IndexerError;
 
 const MAX_LOG_B64: usize = 256;
+const MAX_STACK_DEPTH: usize = 64;
 
+/// Extract AgentBond protocol events using Solana invoke-stack attribution.
 pub fn extract_protocol_events(
     program: &Pubkey,
     signature: &str,
@@ -21,12 +23,42 @@ pub fn extract_protocol_events(
     logs: &[String],
     commitment: Commitment,
 ) -> Result<Vec<RawProtocolEvent>, IndexerError> {
+    let program_str = program.to_string();
+    let mut stack: Vec<String> = Vec::new();
     let mut out = Vec::new();
     let mut event_index = 0u32;
+
     for log in logs {
+        if let Some(rest) = log.strip_prefix("Program ")
+            && let Some((id, after)) = rest.split_once(' ')
+        {
+            if after.starts_with("invoke") {
+                if stack.len() < MAX_STACK_DEPTH {
+                    stack.push(id.to_string());
+                }
+                continue;
+            }
+            if after.starts_with("success") || after.starts_with("failed") {
+                if let Some(top) = stack.last()
+                    && top == id
+                {
+                    stack.pop();
+                } else if !stack.is_empty() {
+                    let _ = stack.pop();
+                }
+                continue;
+            }
+        }
+
         let Some(data) = log.strip_prefix("Program data: ") else {
             continue;
         };
+        let Some(active) = stack.last() else {
+            continue;
+        };
+        if active != &program_str {
+            continue;
+        }
         let trimmed = data.trim();
         if trimmed.len() > MAX_LOG_B64 * 2 {
             continue;
@@ -54,7 +86,6 @@ pub fn extract_protocol_events(
         });
         event_index = event_index.saturating_add(1);
     }
-    let _ = program;
     Ok(out)
 }
 
@@ -114,14 +145,7 @@ pub fn decode_account_update(
         return Ok((raw, None));
     }
     let data = data.unwrap_or_default();
-    // Indexer validates owner/layout only. PDA identity is not required for read-model staging.
-    let projection = match try_decode_owned(&data, address.to_bytes(), slot, write_version) {
-        Ok(p) => p,
-        Err(e) => {
-            tracing::warn!(error = %e, "owned account layout rejected");
-            None
-        }
-    };
+    let projection = try_decode_owned(&data, address.to_bytes(), slot, write_version);
     Ok((raw, projection))
 }
 
@@ -130,11 +154,11 @@ fn try_decode_owned(
     address: [u8; 32],
     slot: u64,
     write_version: u64,
-) -> Result<Option<DecodedProjection>, IndexerError> {
+) -> Option<DecodedProjection> {
     if data.len() == CONFIG_ACCOUNT_LEN
         && let Ok(cfg) = ConfigAccount::decode(data)
     {
-        return Ok(Some(DecodedProjection {
+        return Some(DecodedProjection {
             kind: ProjectionKind::Config,
             address,
             slot,
@@ -149,7 +173,7 @@ fn try_decode_owned(
                 min_provider_bond: cfg.min_provider_bond,
                 challenge_duration_seconds: cfg.challenge_duration_seconds as u64,
             },
-        }));
+        });
     }
     if data.len() == PROVIDER_ACCOUNT_LEN
         && let Ok(provider) = ProviderAccount::decode(data)
@@ -159,7 +183,7 @@ fn try_decode_owned(
         } else {
             "Inactive".into()
         };
-        return Ok(Some(DecodedProjection {
+        return Some(DecodedProjection {
             kind: ProjectionKind::Provider,
             address,
             slot,
@@ -169,12 +193,12 @@ fn try_decode_owned(
                 status,
                 execution_key_count: provider.execution_key_count,
             },
-        }));
+        });
     }
     if data.len() == PROVIDER_BOND_ACCOUNT_LEN
         && let Ok(bond) = ProviderBondAccount::decode(data)
     {
-        return Ok(Some(DecodedProjection {
+        return Some(DecodedProjection {
             kind: ProjectionKind::ProviderBond,
             address,
             slot,
@@ -185,12 +209,12 @@ fn try_decode_owned(
                 deposited: bond.deposited,
                 locked: bond.locked,
             },
-        }));
+        });
     }
     if data.len() == JOB_ACCOUNT_LEN
         && let Ok(job) = JobAccount::decode(data)
     {
-        return Ok(Some(DecodedProjection {
+        return Some(DecodedProjection {
             kind: ProjectionKind::Job,
             address,
             slot,
@@ -212,7 +236,7 @@ fn try_decode_owned(
                 locked_bond: job.locked_bond,
                 mint_decimals: job.mint_decimals,
             },
-        }));
+        });
     }
     if data.len() == CHALLENGE_ACCOUNT_LEN
         && let Ok(challenge) = ChallengeAccount::decode(data)
@@ -222,7 +246,7 @@ fn try_decode_owned(
         } else {
             "Resolved".into()
         };
-        return Ok(Some(DecodedProjection {
+        return Some(DecodedProjection {
             kind: ProjectionKind::Challenge,
             address,
             slot,
@@ -235,7 +259,7 @@ fn try_decode_owned(
                 deadline: challenge.deadline,
                 status,
             },
-        }));
+        });
     }
-    Ok(None)
+    None
 }

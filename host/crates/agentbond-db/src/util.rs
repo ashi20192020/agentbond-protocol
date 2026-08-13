@@ -2,6 +2,14 @@ use rust_decimal::Decimal;
 
 use crate::error::DbError;
 
+pub fn u64_to_i64(v: u64) -> Result<i64, DbError> {
+    i64::try_from(v).map_err(|_| DbError::Validation(format!("u64 does not fit i64: {v}")))
+}
+
+pub fn i64_to_u64(v: i64) -> Result<u64, DbError> {
+    u64::try_from(v).map_err(|_| DbError::Validation(format!("negative i64: {v}")))
+}
+
 pub fn u64_to_numeric(v: u64) -> Decimal {
     Decimal::from(v)
 }

@@ -39,19 +39,19 @@ Payment challenges use cryptographically random memos bound to route and input d
 
 ## 8. Yellowstone ingestion
 
-A production Yellowstone gRPC client (9.1.x, Apache-2.0 packages) streams slots, program accounts, and transactions behind a `ChainSource` trait. Fixture replay keeps tests offline.
+A production Yellowstone gRPC client (9.1.x, Apache-2.0 packages) streams slots, program accounts, and transactions behind a `ChainSource` trait. Subscribe requests resume from the stored finalized checkpoint when supported. Fixture replay keeps tests offline. Protocol `Program data:` lines are accepted only while AgentBond is the active invoke-stack program.
 
 ## 9. Fork-safe finalized projection
 
-Processed data stages privately. Public projections update only on finalized slots, together with checkpoint advancement, in one database transaction. Dead forks clean non-finalized staging only.
+Processed account updates persist raw rows and staged decoded projections in PostgreSQL. Public projections and checkpoint advancement apply together when a slot finalizes. Restart between processed ingestion and finalization keeps staged work. Dead forks clean non-finalized staging only. Gap repair may restore events via bounded `getBlock` and leaves gaps `partial` until account coverage is reconciled.
 
 ## 10. PostgreSQL settlement recovery
 
-Production gateway requires `AGENTBOND_DATABASE_URL`. Challenges and settlements persist across restarts. Lease expiry allows recovery after crashes. A remaining honest gap: facilitator-side exactly-once is outside AgentBond’s control.
+Production gateway requires `AGENTBOND_DATABASE_URL` and already-applied migrations. Challenges and settlements persist across restarts. Lease expiry allows recovery after crashes. A remaining honest gap: facilitator-side exactly-once is outside AgentBond’s control.
 
 ## 11. Tests and measured compute units
 
-Root program tests and LiteSVM CU measurements remain from earlier milestones. Host tests cover MCP transport, gateway boundaries, offline simulate-before-send, decoder vectors, fixture projection, and PostgreSQL payment recovery.
+Root program tests and LiteSVM CU measurements remain from earlier milestones. Host tests cover MCP transport, gateway boundaries, offline simulate-before-send, invoke-stack decoding, restart-safe projections, indexed API validation, metrics endpoints, and PostgreSQL payment recovery.
 
 ## 12. Honest limitations
 
@@ -61,6 +61,7 @@ Root program tests and LiteSVM CU measurements remain from earlier milestones. H
 - No Token-2022, MPP, SAS, confidential transfers, or TEE verification
 - No live deployment automation
 - Indexer lag means indexed reads are not a substitute for live plan validation
+- Gap repair is not claimed complete without account reconciliation
 - Persistent local settlement does not guarantee global exactly-once facilitator delivery
 
 ## 13. Recruiter-focused technical highlights
@@ -70,6 +71,6 @@ Root program tests and LiteSVM CU measurements remain from earlier milestones. H
 - Transport-neutral unsigned instruction plans
 - RMCP MCP server with real duplex transport tests
 - Narrow unofficial x402 resource-server adapter with lease-based recovery
-- Yellowstone gRPC indexer with fork-safe PostgreSQL projections
-- Cursor-paginated finalized read APIs
-- Offline-first CI with PostgreSQL service container and SBF size budget
+- Yellowstone gRPC indexer with durable staged projections and checkpoint resume
+- Cursor-paginated finalized read APIs with strict validation
+- Offline-first CI with pinned PostgreSQL 16.6, explicit migrate, SBF install, and size budget

@@ -36,8 +36,10 @@
       "slot": 1,
       "commitment": "processed",
       "logs": [
+        "Program iTRhr3SWUeJAjjSzeegGuGei5gDdCxaxhs93sotsCjo invoke [1]",
         "Program data: AQgJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgI6AMAAAAAAAAA8VNlAAAAAA==",
-        "Program data: AQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgI6AMAAAAAAAAB8VNlAAAAAA=="
+        "Program data: AQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgI6AMAAAAAAAAB8VNlAAAAAA==",
+        "Program iTRhr3SWUeJAjjSzeegGuGei5gDdCxaxhs93sotsCjo success"
       ]
     },
     {

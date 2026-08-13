@@ -14,4 +14,6 @@ pub use error::IndexerError;
 pub use fixture::{FixtureSource, replay_fixture};
 pub use metrics::IndexerMetrics;
 pub use source::{AccountUpdate, ChainSource, ChainUpdate};
-pub use yellowstone::{YellowstoneConfig, YellowstoneSource, validate_yellowstone_url};
+pub use yellowstone::{
+    YellowstoneConfig, YellowstoneSource, build_subscribe_request, validate_yellowstone_url,
+};

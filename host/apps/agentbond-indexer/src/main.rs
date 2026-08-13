@@ -8,6 +8,7 @@ use agentbond_indexer::{
     replay_fixture,
 };
 use axum::Router;
+use axum::http::{HeaderMap, HeaderValue, StatusCode};
 use axum::routing::get;
 use clap::{Parser, Subcommand};
 use solana_pubkey::Pubkey;
@@ -51,13 +52,17 @@ async fn main() -> anyhow::Result<()> {
             info!("migrations applied");
         }
         Commands::Replay { fixture } => {
-            db.migrate().await?;
+            db.migrations_status()
+                .await
+                .map_err(|e| anyhow::anyhow!("{e}"))?;
             let metrics = IndexerMetrics::new().map_err(|e| anyhow::anyhow!(e))?;
             replay_fixture(db, fixture, &metrics).await?;
             info!("fixture replay complete");
         }
         Commands::Run => {
-            db.migrate().await?;
+            db.migrations_status()
+                .await
+                .map_err(|e| anyhow::anyhow!("{e}"))?;
             let metrics = IndexerMetrics::new().map_err(|e| anyhow::anyhow!(e))?;
             let metrics_bg = metrics.clone();
             let db_health = db.clone();
@@ -66,7 +71,10 @@ async fn main() -> anyhow::Result<()> {
                     warn!(error = %e, "ops server stopped");
                 }
             });
-            let ys = YellowstoneConfig::from_env()?;
+            let repo = ProjectionRepo::new(db.pool().clone());
+            let (finalized, _) = repo.checkpoint().await?;
+            let from_slot = if finalized > 0 { Some(finalized) } else { None };
+            let ys = YellowstoneConfig::from_env()?.with_from_slot(from_slot);
             let rpc_url = std::env::var("AGENTBOND_RPC_URL")
                 .map_err(|_| anyhow::anyhow!("AGENTBOND_RPC_URL is required for run"))?;
             let program_id: Pubkey = std::env::var("AGENTBOND_PROGRAM_ID")
@@ -99,11 +107,11 @@ async fn serve_ops(metrics: IndexerMetrics, db: Arc<Db>) -> anyhow::Result<()> {
                         let repo = ProjectionRepo::new(db.pool().clone());
                         match (
                             db.health().await,
-                            db.migrations_current().await,
+                            db.migrations_status().await,
                             repo.checkpoint().await,
                         ) {
-                            (Ok(()), Ok(true), Ok(_)) => (axum::http::StatusCode::OK, "ready"),
-                            _ => (axum::http::StatusCode::SERVICE_UNAVAILABLE, "not ready"),
+                            (Ok(()), Ok(()), Ok(_)) => (StatusCode::OK, "ready"),
+                            _ => (StatusCode::SERVICE_UNAVAILABLE, "not ready"),
                         }
                     }
                 }
@@ -115,7 +123,25 @@ async fn serve_ops(metrics: IndexerMetrics, db: Arc<Db>) -> anyhow::Result<()> {
                 let metrics = metrics.clone();
                 move || {
                     let metrics = metrics.clone();
-                    async move { metrics.render() }
+                    async move {
+                        match metrics.render() {
+                            Ok(body) => {
+                                let mut headers = HeaderMap::new();
+                                headers.insert(
+                                    axum::http::header::CONTENT_TYPE,
+                                    HeaderValue::from_static(
+                                        "text/plain; version=0.0.4; charset=utf-8",
+                                    ),
+                                );
+                                (StatusCode::OK, headers, body)
+                            }
+                            Err(_) => (
+                                StatusCode::INTERNAL_SERVER_ERROR,
+                                HeaderMap::new(),
+                                String::from("metrics encode failed"),
+                            ),
+                        }
+                    }
                 }
             }),
         );

@@ -77,14 +77,14 @@ impl ReadRepo {
         .fetch_one(&self.pool)
         .await?;
         let (gaps,): (i64,) = sqlx::query_as(
-            "SELECT COUNT(*)::bigint FROM ingestion_gaps WHERE status IN ('open','failed','repairing')",
+            "SELECT COUNT(*)::bigint FROM ingestion_gaps WHERE status IN ('open','failed','repairing','partial')",
         )
         .fetch_one(&self.pool)
         .await?;
         Ok(IndexStatusDto {
             as_of_slot: finalized.to_string(),
             processed_slot: processed.to_string(),
-            open_gaps: gaps as u64,
+            open_gaps: crate::util::i64_to_u64(gaps)?,
         })
     }
 
@@ -96,7 +96,10 @@ impl ReadRepo {
         buyer: Option<&str>,
         provider: Option<&str>,
     ) -> Result<Page<IndexedJobDto>, DbError> {
-        let limit = limit.clamp(1, 100);
+        let limit = validate_limit(limit)?;
+        if let Some(state) = state {
+            validate_job_state(state)?;
+        }
         let (as_of,): (i64,) =
             sqlx::query_as("SELECT finalized_slot FROM indexer_checkpoints WHERE id = 1")
                 .fetch_one(&self.pool)
@@ -130,8 +133,12 @@ impl ReadRepo {
         .bind(limit + 1)
         .fetch_all(&self.pool)
         .await?;
+        let has_more = rows.len() > limit as usize;
         let mut items = Vec::new();
         for row in rows.into_iter().take(limit as usize) {
+            if row.as_of_slot > as_of {
+                return Err(DbError::Conflict("projection newer than checkpoint".into()));
+            }
             items.push(IndexedJobDto {
                 address: pk_str(&row.address)?,
                 as_of_slot: row.as_of_slot.to_string(),
@@ -142,7 +149,7 @@ impl ReadRepo {
                 state: row.state,
             });
         }
-        let next_cursor = if items.len() == limit as usize {
+        let next_cursor = if has_more {
             items.last().map(|j| j.address.clone())
         } else {
             None
@@ -160,7 +167,7 @@ impl ReadRepo {
         limit: i64,
         cursor: Option<&str>,
     ) -> Result<Page<JobHistoryItemDto>, DbError> {
-        let limit = limit.clamp(1, 100);
+        let limit = validate_limit(limit)?;
         let addr = pk_bytes(address)?;
         let (as_of,): (i64,) =
             sqlx::query_as("SELECT finalized_slot FROM indexer_checkpoints WHERE id = 1")
@@ -181,6 +188,7 @@ impl ReadRepo {
         .bind(limit + 1)
         .fetch_all(&self.pool)
         .await?;
+        let has_more = rows.len() > limit as usize;
         let mut items = Vec::new();
         for row in rows.into_iter().take(limit as usize) {
             items.push(JobHistoryItemDto {
@@ -193,11 +201,10 @@ impl ReadRepo {
                 event_timestamp: row.event_timestamp,
             });
         }
-        let next_cursor = items
-            .last()
-            .map(|i| format!("{}:{}", i.signature, i.event_index));
-        let next_cursor = if items.len() == limit as usize {
-            next_cursor
+        let next_cursor = if has_more {
+            items
+                .last()
+                .map(|i| format!("{}:{}", i.signature, i.event_index))
         } else {
             None
         };
@@ -213,7 +220,7 @@ impl ReadRepo {
         limit: i64,
         cursor: Option<&str>,
     ) -> Result<Page<IndexedProviderDto>, DbError> {
-        let limit = limit.clamp(1, 100);
+        let limit = validate_limit(limit)?;
         let (as_of,): (i64,) =
             sqlx::query_as("SELECT finalized_slot FROM indexer_checkpoints WHERE id = 1")
                 .fetch_one(&self.pool)
@@ -231,6 +238,7 @@ impl ReadRepo {
         .bind(limit + 1)
         .fetch_all(&self.pool)
         .await?;
+        let has_more = rows.len() > limit as usize;
         let mut items = Vec::new();
         for row in rows.into_iter().take(limit as usize) {
             items.push(IndexedProviderDto {
@@ -240,7 +248,7 @@ impl ReadRepo {
                 status: row.status,
             });
         }
-        let next_cursor = if items.len() == limit as usize {
+        let next_cursor = if has_more {
             items.last().map(|p| p.address.clone())
         } else {
             None
@@ -258,7 +266,7 @@ impl ReadRepo {
         limit: i64,
         cursor: Option<&str>,
     ) -> Result<Page<ProviderActivityItemDto>, DbError> {
-        let limit = limit.clamp(1, 100);
+        let limit = validate_limit(limit)?;
         let addr = pk_bytes(address)?;
         let (as_of,): (i64,) =
             sqlx::query_as("SELECT finalized_slot FROM indexer_checkpoints WHERE id = 1")
@@ -279,6 +287,7 @@ impl ReadRepo {
         .bind(limit + 1)
         .fetch_all(&self.pool)
         .await?;
+        let has_more = rows.len() > limit as usize;
         let mut items = Vec::new();
         for row in rows.into_iter().take(limit as usize) {
             items.push(ProviderActivityItemDto {
@@ -291,7 +300,7 @@ impl ReadRepo {
                 event_timestamp: row.event_timestamp,
             });
         }
-        let next_cursor = if items.len() == limit as usize {
+        let next_cursor = if has_more {
             items
                 .last()
                 .map(|i| format!("{}:{}", i.signature, i.event_index))
@@ -303,6 +312,23 @@ impl ReadRepo {
             items,
             next_cursor,
         })
+    }
+}
+
+fn validate_limit(limit: i64) -> Result<i64, DbError> {
+    if !(1..=100).contains(&limit) {
+        return Err(DbError::Validation(
+            "limit must be between 1 and 100".into(),
+        ));
+    }
+    Ok(limit)
+}
+
+fn validate_job_state(state: &str) -> Result<(), DbError> {
+    match state {
+        "Created" | "Funded" | "Accepted" | "Submitted" | "Challenged" | "Settled" | "Refunded"
+        | "Expired" | "Slashed" | "Closed" => Ok(()),
+        _ => Err(DbError::Validation(format!("invalid job state: {state}"))),
     }
 }
 

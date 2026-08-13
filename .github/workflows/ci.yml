@@ -20,22 +20,31 @@ jobs:
       - uses: dtolnay/rust-toolchain@1.84.0
         with:
           components: rustfmt, clippy
+      - name: Install Agave SBF toolchain
+        run: |
+          sh -c "$(curl -sSfL https://release.anza.xyz/v2.1.21/install)"
+          echo "$HOME/.local/share/solana/install/active_release/bin" >> "$GITHUB_PATH"
+      - name: Tool versions
+        run: |
+          rustc --version
+          cargo --version
+          cargo build-sbf --version || solana --version
       - uses: actions/cache@v4
         with:
           path: |
             ~/.cargo/registry
             ~/.cargo/git
-            target
-          key: root-${{ runner.os }}-${{ hashFiles('Cargo.lock') }}
+          key: root-deps-${{ runner.os }}-${{ hashFiles('Cargo.lock') }}
       - run: cargo fmt --all -- --check
       - run: cargo clippy --workspace --all-targets --all-features -- -D warnings
-      - run: cargo test --workspace --all-features
-      - run: cargo build-sbf --manifest-path programs/agentbond/Cargo.toml --features bpf-entrypoint
+      - name: Build SBF program
+        run: cargo build-sbf --manifest-path programs/agentbond/Cargo.toml --features bpf-entrypoint
       - name: SBF size budget
         run: |
           SIZE=$(wc -c < target/deploy/agentbond.so)
           echo "size=$SIZE"
           test "$SIZE" -le 180000
+      - run: cargo test --workspace --all-features
       - run: git diff --check
 
   host:
@@ -59,17 +68,28 @@ jobs:
       - uses: dtolnay/rust-toolchain@1.88.0
         with:
           components: rustfmt, clippy
+      - name: Install Agave SBF toolchain for simulator binary
+        run: |
+          sh -c "$(curl -sSfL https://release.anza.xyz/v2.1.21/install)"
+          echo "$HOME/.local/share/solana/install/active_release/bin" >> "$GITHUB_PATH"
+          cargo build-sbf --manifest-path programs/agentbond/Cargo.toml --features bpf-entrypoint
+      - name: Tool versions
+        run: |
+          rustc --version
+          cargo --version
       - uses: actions/cache@v4
         with:
           path: |
             ~/.cargo/registry
             ~/.cargo/git
-            host/target
-          key: host-${{ runner.os }}-${{ hashFiles('host/Cargo.lock') }}
+          key: host-deps-${{ runner.os }}-${{ hashFiles('host/Cargo.lock') }}
       - run: cargo fmt --manifest-path host/Cargo.toml --all -- --check
       - run: cargo clippy --manifest-path host/Cargo.toml --workspace --all-targets --all-features -- -D warnings
       - run: cargo run --manifest-path host/Cargo.toml -p agentbond-indexer-app --bin agentbond-indexer -- migrate
       - run: cargo test --manifest-path host/Cargo.toml --workspace --all-features
-      - run: cargo run --manifest-path host/Cargo.toml -p agentbond-indexer-app --bin agentbond-indexer -- replay --fixture host/fixtures/indexer/lifecycle.json
+      - name: Fixture replay twice
+        run: |
+          cargo run --manifest-path host/Cargo.toml -p agentbond-indexer-app --bin agentbond-indexer -- replay --fixture host/fixtures/indexer/lifecycle.json
+          cargo run --manifest-path host/Cargo.toml -p agentbond-indexer-app --bin agentbond-indexer -- replay --fixture host/fixtures/indexer/lifecycle.json
       - run: cargo run --manifest-path host/Cargo.toml -p agentbond-sim
       - run: git diff --check

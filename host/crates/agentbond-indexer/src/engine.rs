@@ -1,10 +1,9 @@
-use std::collections::HashMap;
 use std::sync::Arc;
 
 use futures::StreamExt;
 use tracing::{info, warn};
 
-use agentbond_db::{Commitment, Db, DecodedProjection, ProjectionRepo};
+use agentbond_db::{Commitment, Db, ProjectionRepo};
 
 use crate::backfill::{GapBackfill, MAX_BACKFILL_SLOTS, NullBackfill};
 use crate::error::IndexerError;
@@ -33,9 +32,18 @@ impl IndexerEngine {
 
     pub async fn run_source(&self, source: &dyn ChainSource) -> Result<(), IndexerError> {
         let repo = ProjectionRepo::new(self.db.pool().clone());
+        let (finalized, processed) = repo.checkpoint().await?;
+        let mut last_slot = if processed > 0 {
+            Some(processed)
+        } else if finalized > 0 {
+            Some(finalized)
+        } else {
+            None
+        };
+        self.metrics
+            .checkpoint_slot
+            .set(i64::try_from(finalized).unwrap_or(i64::MAX));
         let mut stream = source.subscribe().await?;
-        let mut pending: HashMap<u64, Vec<DecodedProjection>> = HashMap::new();
-        let mut last_slot: Option<u64> = None;
 
         while let Some(item) = stream.next().await {
             let update = match item {
@@ -45,23 +53,17 @@ impl IndexerEngine {
                     return Err(e);
                 }
             };
-            if let Some((from, to)) = self
-                .ingest_update(&repo, &mut pending, &mut last_slot, update)
-                .await?
-            {
-                self.repair_gap(&repo, &mut pending, &mut last_slot, from, to)
-                    .await?;
+            if let Some((from, to)) = self.ingest_update(&repo, &mut last_slot, update).await? {
+                self.repair_gap(&repo, &mut last_slot, from, to).await?;
             }
         }
         info!("indexer source completed");
         Ok(())
     }
 
-    /// Returns `Some((from,to))` when a gap should be repaired.
     async fn ingest_update(
         &self,
         repo: &ProjectionRepo,
-        pending: &mut HashMap<u64, Vec<DecodedProjection>>,
         last_slot: &mut Option<u64>,
         update: ChainUpdate,
     ) -> Result<Option<(u64, u64)>, IndexerError> {
@@ -69,58 +71,58 @@ impl IndexerEngine {
         let mut gap = None;
         match update {
             ChainUpdate::Slot(slot) => {
-                if let Some(prev) = *last_slot
-                    && slot.slot > prev + 1
-                {
-                    let from = prev + 1;
-                    let to = slot.slot - 1;
-                    repo.record_gap(from, to).await?;
-                    self.metrics.detected_gaps.inc();
-                    warn!(from, to, "ingestion gap detected");
-                    gap = Some((from, to));
+                // Only advance gap tracking forward; ignore older notifications.
+                if let Some(prev) = *last_slot {
+                    if slot.slot > prev + 1 {
+                        let from = prev + 1;
+                        let to = slot.slot - 1;
+                        repo.record_gap(from, to).await?;
+                        self.metrics.detected_gaps.inc();
+                        warn!(from, to, "ingestion gap detected");
+                        gap = Some((from, to));
+                        *last_slot = Some(slot.slot);
+                    } else if slot.slot > prev {
+                        *last_slot = Some(slot.slot);
+                    }
+                } else {
+                    *last_slot = Some(slot.slot);
                 }
-                *last_slot = Some(slot.slot);
+
                 if let Err(e) = repo.upsert_slot(&slot).await {
                     self.metrics.database_errors.inc();
                     return Err(e.into());
                 }
                 if slot.status == Commitment::Finalized {
-                    let projections = pending.remove(&slot.slot).unwrap_or_default();
-                    if let Err(e) = repo.finalize_slot(slot.slot, &projections).await {
-                        self.metrics.database_errors.inc();
-                        return Err(e.into());
+                    match repo.finalize_slot(slot.slot).await {
+                        Ok(n) => {
+                            self.metrics.finalized_projections.inc_by(n);
+                            if let Ok(v) = i64::try_from(slot.slot) {
+                                self.metrics.current_finalized_slot.set(v);
+                            }
+                            if let Ok((finalized, _)) = repo.checkpoint().await
+                                && let Ok(v) = i64::try_from(finalized)
+                            {
+                                self.metrics.checkpoint_slot.set(v);
+                            }
+                        }
+                        Err(e) => {
+                            self.metrics.database_errors.inc();
+                            return Err(e.into());
+                        }
                     }
-                    self.metrics
-                        .finalized_projections
-                        .inc_by(projections.len() as u64);
-                    self.metrics.current_finalized_slot.set(slot.slot as i64);
-                    if let Ok((finalized, _)) = repo.checkpoint().await {
-                        self.metrics.checkpoint_slot.set(finalized as i64);
-                    }
-                } else if slot.status == Commitment::Dead {
-                    pending.remove(&slot.slot);
                 }
             }
             ChainUpdate::Account(account) => {
                 let AccountUpdate { raw, projection } = *account;
-                match repo.insert_account_version(&raw).await {
+                match repo
+                    .insert_account_with_projection(&raw, projection.as_ref())
+                    .await
+                {
                     Ok(true) => {}
                     Ok(false) => self.metrics.duplicate_updates.inc(),
                     Err(e) => {
                         self.metrics.database_errors.inc();
                         return Err(e.into());
-                    }
-                }
-                if let Some(p) = projection {
-                    if raw.commitment == Commitment::Finalized {
-                        if let Err(e) = repo.finalize_slot(raw.slot, std::slice::from_ref(&p)).await
-                        {
-                            self.metrics.database_errors.inc();
-                            return Err(e.into());
-                        }
-                        self.metrics.finalized_projections.inc();
-                    } else {
-                        pending.entry(raw.slot).or_default().push(p);
                     }
                 }
             }
@@ -143,7 +145,6 @@ impl IndexerEngine {
     async fn repair_gap(
         &self,
         repo: &ProjectionRepo,
-        pending: &mut HashMap<u64, Vec<DecodedProjection>>,
         last_slot: &mut Option<u64>,
         from: u64,
         to: u64,
@@ -159,7 +160,7 @@ impl IndexerEngine {
             match self.backfill.fetch_slot(slot).await {
                 Ok(updates) => {
                     for update in updates {
-                        let nested = self.ingest_update(repo, pending, last_slot, update).await?;
+                        let nested = self.ingest_update(repo, last_slot, update).await?;
                         if nested.is_some() {
                             return Err(IndexerError::Backfill(
                                 "nested gap during backfill is unsupported".into(),
@@ -168,14 +169,31 @@ impl IndexerEngine {
                     }
                 }
                 Err(e) => {
-                    warn!(slot, error = %e, "gap backfill failed");
+                    warn!(slot, error = %e, "gap event backfill failed");
                     repo.mark_gap_failed(from, to, &e.to_string()).await?;
                     return Ok(());
                 }
             }
         }
-        repo.mark_gap_repaired(from, to).await?;
-        info!(from, to, "gap repaired via backfill");
+        // getBlock repairs events only; account coverage remains unknown until GPA reconcile.
+        match self.backfill.reconcile_accounts(from, to).await {
+            Ok(true) => {
+                repo.mark_gap_repaired(from, to).await?;
+                info!(from, to, "gap fully repaired (events + accounts)");
+            }
+            Ok(false) => {
+                repo.mark_gap_partial(
+                    from,
+                    to,
+                    "events repaired via getBlock; account projections pending reconciliation",
+                )
+                .await?;
+                info!(from, to, "gap partially repaired (events only)");
+            }
+            Err(e) => {
+                repo.mark_gap_partial(from, to, &e.to_string()).await?;
+            }
+        }
         Ok(())
     }
 }

@@ -3,6 +3,7 @@ use std::sync::Arc;
 
 use agentbond_app::{AppConfig, ServiceCatalog};
 use agentbond_db::{Db, PgChallengeStore, PgSettlementStore, redact_db_url};
+use agentbond_gateway::metrics::{MeteredSettlementStore, PaymentMetrics};
 use agentbond_gateway::{AppState, router};
 use agentbond_payments::{
     FacilitatorClient, HttpFacilitatorClient, MemoryChallengeStore, MemorySettlementStore,
@@ -49,10 +50,15 @@ async fn main() -> anyhow::Result<()> {
         )
     };
 
+    let payment_metrics = Arc::new(PaymentMetrics::new()?);
+
     let (challenges, settlements, db) = if use_mock {
         (
             Arc::new(MemoryChallengeStore::new()) as Arc<dyn agentbond_payments::ChallengeStore>,
-            Arc::new(MemorySettlementStore::new()) as Arc<dyn agentbond_payments::SettlementStore>,
+            Arc::new(MeteredSettlementStore::new(
+                Arc::new(MemorySettlementStore::new()),
+                payment_metrics.clone(),
+            )) as Arc<dyn agentbond_payments::SettlementStore>,
             None,
         )
     } else {
@@ -61,12 +67,16 @@ async fn main() -> anyhow::Result<()> {
         })?;
         info!(db = %redact_db_url(&database_url), "database configured");
         let db = Arc::new(Db::connect(&database_url).await?);
-        db.migrate().await?;
+        db.migrations_status()
+            .await
+            .map_err(|e| anyhow::anyhow!("{e}"))?;
         (
             Arc::new(PgChallengeStore::new(db.pool().clone()))
                 as Arc<dyn agentbond_payments::ChallengeStore>,
-            Arc::new(PgSettlementStore::new(db.pool().clone()))
-                as Arc<dyn agentbond_payments::SettlementStore>,
+            Arc::new(MeteredSettlementStore::new(
+                Arc::new(PgSettlementStore::new(db.pool().clone())),
+                payment_metrics.clone(),
+            )) as Arc<dyn agentbond_payments::SettlementStore>,
             Some(db),
         )
     };
@@ -79,6 +89,7 @@ async fn main() -> anyhow::Result<()> {
         challenges,
         settlements,
         db,
+        payment_metrics,
     };
 
     let app = router(state, cfg.max_request_bytes, timeout);

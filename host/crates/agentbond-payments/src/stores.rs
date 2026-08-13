@@ -42,6 +42,17 @@ impl Default for LeaseToken {
 pub enum BeginOutcome {
     Cached(PaidDemoResult),
     Acquired(LeaseToken),
+    /// Lease re-acquired after an expired in-progress lease.
+    RecoveredStale(LeaseToken),
+}
+
+impl BeginOutcome {
+    pub fn lease(self) -> Option<LeaseToken> {
+        match self {
+            Self::Acquired(lease) | Self::RecoveredStale(lease) => Some(lease),
+            Self::Cached(_) => None,
+        }
+    }
 }
 
 #[async_trait]
