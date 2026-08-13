@@ -33,6 +33,12 @@ wiremock = { workspace = true }
 
 [dev-dependencies]
 assert_cmd = "2"
+bs58 = { workspace = true }
 predicates = "3"
+serde_json = { workspace = true }
+solana-hash = { workspace = true }
+solana-keypair = { workspace = true }
+solana-signer = { workspace = true }
 tempfile = "3"
 tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
+wiremock = { workspace = true }

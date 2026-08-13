@@ -143,6 +143,8 @@ pub struct MockChainReader {
     accounts: Mutex<HashMap<Pubkey, AccountData>>,
     timestamp: Mutex<i64>,
     ready: Mutex<bool>,
+    fail_rpc: Mutex<bool>,
+    delay: Mutex<Option<Duration>>,
 }
 
 impl MockChainReader {
@@ -151,6 +153,8 @@ impl MockChainReader {
             accounts: Mutex::new(HashMap::new()),
             timestamp: Mutex::new(1_700_000_000),
             ready: Mutex::new(true),
+            fail_rpc: Mutex::new(false),
+            delay: Mutex::new(None),
         }
     }
 
@@ -166,18 +170,38 @@ impl MockChainReader {
         *self.ready.lock().await = ready;
     }
 
+    pub async fn set_fail_rpc(&self, fail: bool) {
+        *self.fail_rpc.lock().await = fail;
+    }
+
+    pub async fn set_delay(&self, delay: Option<Duration>) {
+        *self.delay.lock().await = delay;
+    }
+
     pub fn shared(self) -> Arc<Self> {
         Arc::new(self)
+    }
+
+    async fn maybe_fail_or_delay(&self) -> Result<(), SdkError> {
+        if let Some(delay) = *self.delay.lock().await {
+            tokio::time::sleep(delay).await;
+        }
+        if *self.fail_rpc.lock().await {
+            return Err(SdkError::Rpc("mock rpc failure".into()));
+        }
+        Ok(())
     }
 }
 
 #[async_trait]
 impl ChainReader for MockChainReader {
     async fn get_account(&self, address: &Pubkey) -> Result<Option<AccountData>, SdkError> {
+        self.maybe_fail_or_delay().await?;
         Ok(self.accounts.lock().await.get(address).cloned())
     }
 
     async fn get_unix_timestamp(&self) -> Result<i64, SdkError> {
+        self.maybe_fail_or_delay().await?;
         Ok(*self.timestamp.lock().await)
     }
 

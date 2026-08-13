@@ -29,5 +29,9 @@ tracing-subscriber = { workspace = true }
 
 [dev-dependencies]
 agentbond-types = { workspace = true }
-tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
+anyhow = { workspace = true }
+solana-pubkey = { workspace = true }
+tokio = { workspace = true, features = ["macros", "rt-multi-thread", "io-util"] }
 tokio-util = "0.7"
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }

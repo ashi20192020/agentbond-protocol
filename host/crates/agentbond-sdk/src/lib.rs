@@ -26,6 +26,6 @@ pub use receipt::{
 };
 pub use rpc::{AccountData, ChainReader, HttpChainReader, MockChainReader};
 pub use submit::{
-    ClusterKind, MAINNET_GENESIS_HASH, SubmitResult, cluster_from_genesis_hash,
+    ClusterKind, ConfirmPolicy, MAINNET_GENESIS_HASH, SubmitResult, cluster_from_genesis_hash,
     simulate_and_send_plan, validate_plan_instructions,
 };

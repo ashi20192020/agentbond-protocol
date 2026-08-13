@@ -1,9 +1,15 @@
 use agentbond_app::AppError;
 use agentbond_payments::PaymentError;
+use agentbond_sdk::SdkError;
 use axum::Json;
 use axum::http::{HeaderMap, HeaderValue, StatusCode};
 use axum::response::{IntoResponse, Response};
 use serde_json::{Value, json};
+use tokio::task_local;
+
+task_local! {
+    pub static REQUEST_ID: String;
+}
 
 pub type ApiResult<T> = Result<T, ApiError>;
 
@@ -60,8 +66,20 @@ impl From<AppError> for ApiError {
         match value {
             AppError::NotFound(m) => Self::new(StatusCode::NOT_FOUND, "not_found", m),
             AppError::Validation(m) | AppError::Config(m) => Self::bad_request(m),
-            AppError::Sdk(e) => Self::bad_request(e.to_string()),
+            AppError::Sdk(SdkError::Rpc(m)) => {
+                Self::new(StatusCode::BAD_GATEWAY, "rpc_error", safe_message(&m))
+            }
+            AppError::Sdk(e) => Self::bad_request(safe_message(&e.to_string())),
         }
+    }
+}
+
+fn safe_message(raw: &str) -> String {
+    let lower = raw.to_ascii_lowercase();
+    if lower.contains("private") || lower.contains("secret") || lower.contains("stack") {
+        "request failed".into()
+    } else {
+        raw.to_string()
     }
 }
 
@@ -83,7 +101,11 @@ impl From<PaymentError> for ApiError {
 
 impl IntoResponse for ApiError {
     fn into_response(self) -> Response {
-        let request_id = self.request_id.clone().unwrap_or_else(|| "unknown".into());
+        let request_id = self
+            .request_id
+            .clone()
+            .or_else(|| REQUEST_ID.try_with(|id| id.clone()).ok())
+            .unwrap_or_else(|| "unknown".into());
         let body = Json(json!({
             "error": {
                 "code": self.code,

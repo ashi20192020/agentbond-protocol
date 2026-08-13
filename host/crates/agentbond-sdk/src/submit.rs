@@ -110,6 +110,32 @@ pub struct SubmitResult {
     pub genesis_hash: String,
 }
 
+/// Bounded confirmation polling. Production uses longer intervals; tests use short ones.
+#[derive(Clone, Copy, Debug)]
+pub struct ConfirmPolicy {
+    pub deadline: Duration,
+    pub poll_interval: Duration,
+    pub max_attempts: u32,
+}
+
+impl ConfirmPolicy {
+    pub fn production(deadline: Duration) -> Self {
+        Self {
+            deadline,
+            poll_interval: Duration::from_millis(400),
+            max_attempts: 20,
+        }
+    }
+
+    pub fn fast(deadline: Duration) -> Self {
+        Self {
+            deadline,
+            poll_interval: Duration::from_millis(1),
+            max_attempts: 5,
+        }
+    }
+}
+
 pub async fn simulate_and_send_plan(
     rpc: &HttpChainReader,
     plan: &InstructionPlan,
@@ -117,7 +143,7 @@ pub async fn simulate_and_send_plan(
     payer: &Keypair,
     extra_signers: &[&Keypair],
     allow_mainnet: bool,
-    confirm_deadline: Duration,
+    confirm: ConfirmPolicy,
 ) -> Result<SubmitResult, SdkError> {
     let genesis = rpc.get_genesis_hash().await?;
     let cluster = cluster_from_genesis_hash(&genesis);
@@ -159,7 +185,7 @@ pub async fn simulate_and_send_plan(
     }
 
     let signature = rpc.send_transaction(&tx).await?;
-    let status = rpc.confirm_signature(&signature, confirm_deadline).await?;
+    let status = rpc.confirm_signature(&signature, confirm).await?;
 
     Ok(SubmitResult {
         signature,
@@ -241,12 +267,12 @@ impl HttpChainReader {
     pub async fn confirm_signature(
         &self,
         signature: &str,
-        deadline: Duration,
+        policy: ConfirmPolicy,
     ) -> Result<String, SdkError> {
         let start = Instant::now();
         let mut attempts = 0u32;
         loop {
-            if start.elapsed() > deadline || attempts >= 20 {
+            if start.elapsed() > policy.deadline || attempts >= policy.max_attempts {
                 return Err(SdkError::Rpc("confirmation deadline exceeded".into()));
             }
             attempts += 1;
@@ -256,6 +282,7 @@ impl HttpChainReader {
             }
             #[derive(Deserialize)]
             struct StatusValue {
+                #[serde(rename = "confirmationStatus")]
                 confirmation_status: Option<String>,
                 err: Option<serde_json::Value>,
             }
@@ -276,7 +303,7 @@ impl HttpChainReader {
                     return Ok(cs);
                 }
             }
-            tokio::time::sleep(Duration::from_millis(400)).await;
+            tokio::time::sleep(policy.poll_interval).await;
         }
     }
 }

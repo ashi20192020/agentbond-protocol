@@ -4,7 +4,8 @@ use std::path::PathBuf;
 use std::time::Duration;
 
 use agentbond_sdk::{
-    ClusterKind, HttpChainReader, InstructionPlan, parse_pubkey, program_id, simulate_and_send_plan,
+    ClusterKind, ConfirmPolicy, HttpChainReader, InstructionPlan, parse_pubkey, program_id,
+    simulate_and_send_plan,
 };
 use anyhow::{Context, Result, bail};
 use solana_keypair::Keypair;
@@ -60,7 +61,7 @@ pub async fn run_send(
         &payer,
         &extra_refs,
         allow_mainnet,
-        Duration::from_secs(30),
+        ConfirmPolicy::production(Duration::from_secs(30)),
     )
     .await?;
     println!(

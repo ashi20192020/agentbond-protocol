@@ -139,6 +139,8 @@ Additional send rules:
 - `--yes` required for non-interactive submission
 - No indefinite signing or submission retries
 
+Offline WireMock tests cover the full JSON-RPC send path (`getGenesisHash` → clock → `getLatestBlockhash` → `simulateTransaction` → `sendTransaction` → `getSignatureStatuses`), including simulation-before-submit ordering, negative cases (sim failure, bad program, missing signer, expired plan, mainnet genesis guard, send/confirm errors, bounded confirmation timeout), plus an `assert_cmd` CLI process test against the mock RPC.
+
 ## Gateway endpoints
 
 ```text
@@ -169,7 +171,9 @@ AGENTBOND_USE_MOCK=1 cargo run -p agentbond-gateway -- config/example.config.jso
 
 Config requires `x402_fee_payer` (public key). RPC and facilitator URLs must not embed credentials. Responses include `x-request-id`; structured errors expose a stable code, safe message, and request id (no stack traces).
 
-The gateway never holds user private keys. Escrow plan routes never call the facilitator. The x402 demo route never builds AgentBond escrow plans.
+Gateway HTTP tests cover exact success for every plan route (action, program ID, instruction count, signers, request id), boundary failures (malformed JSON, bad keys/numbers, missing accounts, ineligible timeout, RPC failure, body limit, request timeout), and the x402 matrix (402/`PAYMENT-REQUIRED`, success, exact retry, concurrent settle-once, different-input replay, verify/settle/timeout failures, rejected payload never reaches the facilitator). Escrow plan routes never call the facilitator.
+
+The gateway never holds user private keys. The x402 demo route never builds AgentBond escrow plans.
 
 ## MCP setup
 
@@ -189,6 +193,8 @@ AGENTBOND_USE_MOCK=1 cargo run -p agentbond-mcp -- config/example.config.json
 Tools: `discover_services`, `inspect_provider`, `inspect_job`, `build_create_job`, `build_fund_job`, `build_submit_receipt`, `build_accept_work`, `build_challenge`, `build_timeout_resolution`.
 
 JSON Schema types match request fields (addresses/hashes as strings; nonces/amounts/timestamps as integers; booleans; structured receipt). MCP tools build unsigned instruction plans only. They do not sign or submit and do not accept private keys. Protocol version: `2026-07-28`.
+
+Host tests cover a real RMCP client/server duplex transport (initialize `2026-07-28`, tool listing, every published tool, numeric JSON args, structured tool errors, unknown-tool protocol errors, unsigned plan results, schema private-key bans, stderr logging). Direct dispatch helpers remain for unit checks only.
 
 ## x402 paid-demo flow
 
@@ -284,8 +290,10 @@ Build the SBF binary before LiteSVM program tests or the simulator so they can l
 Current offline verification counts (no internet):
 
 - Root workspace: **127** tests passed
-- Host workspace: **41** tests passed
+- Host workspace: **49** tests passed
 - Simulator: all **6** scenarios passed
+
+Honest remaining limitations: no persistent x402 recovery, no live-cluster integration suite in CI, and the x402 adapter is not an official facilitator SDK.
 
 ## Program binary size
 

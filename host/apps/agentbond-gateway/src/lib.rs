@@ -30,7 +30,7 @@ use tower_http::timeout::TimeoutLayer;
 use tower_http::trace::TraceLayer;
 use uuid::Uuid;
 
-use crate::error::{ApiError, ApiResult};
+use crate::error::{ApiError, ApiResult, REQUEST_ID};
 pub use state::AppState;
 
 /// Test helper: build AppState with mock stores.
@@ -98,7 +98,7 @@ pub fn router(state: AppState, max_body: usize, timeout: Duration) -> Router {
 async fn attach_request_id(mut req: Request<axum::body::Body>, next: Next) -> Response {
     let id = Uuid::new_v4().to_string();
     req.extensions_mut().insert(RequestId(id.clone()));
-    let mut response = next.run(req).await;
+    let mut response = REQUEST_ID.scope(id.clone(), next.run(req)).await;
     if let Ok(v) = HeaderValue::from_str(&id) {
         response.headers_mut().insert("x-request-id", v);
     }
