@@ -1,14 +1,17 @@
 use std::collections::HashMap;
 use std::time::{Duration, Instant};
 
-use sha2::{Digest, Sha256};
+use async_trait::async_trait;
 use tokio::sync::Mutex;
 
 use crate::error::PaymentError;
 use crate::resource::PaidDemoResult;
+use crate::stores::{BeginOutcome, LeaseToken, SettlementStore};
 
 const MAX_ENTRIES: usize = 512;
 const ENTRY_TTL: Duration = Duration::from_secs(120);
+const FAIL_RETRY: Duration = Duration::from_secs(2);
+const LEASE_TTL: Duration = Duration::from_secs(30);
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct SettlementBinding {
@@ -22,6 +25,7 @@ pub struct SettlementBinding {
 enum State {
     Settling {
         binding: SettlementBinding,
+        lease: LeaseToken,
         started: Instant,
     },
     Settled {
@@ -29,47 +33,37 @@ enum State {
         result: PaidDemoResult,
         completed: Instant,
     },
-    /// Failed reservation released after bounded window; key may be retried.
     Failed {
         binding: SettlementBinding,
         failed_at: Instant,
     },
 }
 
-/// Atomic Unseen -> Settling -> Settled keyed by transaction payload digest.
-pub struct SettlementStore {
+pub struct MemorySettlementStore {
     inner: Mutex<HashMap<String, State>>,
 }
 
-impl Default for SettlementStore {
+impl Default for MemorySettlementStore {
     fn default() -> Self {
         Self::new()
     }
 }
 
-impl SettlementStore {
+impl MemorySettlementStore {
     pub fn new() -> Self {
         Self {
             inner: Mutex::new(HashMap::new()),
         }
     }
+}
 
-    pub fn tx_digest(transaction_b64: &str) -> String {
-        let mut hasher = Sha256::new();
-        hasher.update(transaction_b64.as_bytes());
-        hasher
-            .finalize()
-            .iter()
-            .map(|b| format!("{b:02x}"))
-            .collect()
-    }
-
-    /// Reserve for settlement. Returns cached result on exact retry.
-    pub async fn begin(
+#[async_trait]
+impl SettlementStore for MemorySettlementStore {
+    async fn begin(
         &self,
         tx_digest: &str,
         binding: SettlementBinding,
-    ) -> Result<Option<PaidDemoResult>, PaymentError> {
+    ) -> Result<BeginOutcome, PaymentError> {
         let mut guard = self.inner.lock().await;
         evict(&mut guard);
         match guard.get(tx_digest) {
@@ -81,13 +75,27 @@ impl SettlementStore {
                 if existing != &binding {
                     return Err(PaymentError::BindingMismatch);
                 }
-                Ok(Some(result.clone()))
+                Ok(BeginOutcome::Cached(result.clone()))
             }
             Some(State::Settling {
-                binding: existing, ..
+                binding: existing,
+                started,
+                ..
             }) => {
                 if existing != &binding {
                     return Err(PaymentError::BindingMismatch);
+                }
+                if started.elapsed() > LEASE_TTL {
+                    let lease = LeaseToken::new();
+                    guard.insert(
+                        tx_digest.into(),
+                        State::Settling {
+                            binding,
+                            lease: lease.clone(),
+                            started: Instant::now(),
+                        },
+                    );
+                    return Ok(BeginOutcome::Acquired(lease));
                 }
                 Err(PaymentError::SettlementInProgress)
             }
@@ -98,46 +106,52 @@ impl SettlementStore {
                 if existing != &binding {
                     return Err(PaymentError::BindingMismatch);
                 }
-                // Bounded retry: allow re-reserve after 2s.
-                if failed_at.elapsed() < Duration::from_secs(2) {
+                if failed_at.elapsed() < FAIL_RETRY {
                     return Err(PaymentError::SettlementInProgress);
                 }
+                let lease = LeaseToken::new();
                 guard.insert(
                     tx_digest.into(),
                     State::Settling {
                         binding,
+                        lease: lease.clone(),
                         started: Instant::now(),
                     },
                 );
-                Ok(None)
+                Ok(BeginOutcome::Acquired(lease))
             }
             None => {
                 if guard.len() >= MAX_ENTRIES {
                     evict_one_targeted(&mut guard);
                 }
+                let lease = LeaseToken::new();
                 guard.insert(
                     tx_digest.into(),
                     State::Settling {
                         binding,
+                        lease: lease.clone(),
                         started: Instant::now(),
                     },
                 );
-                Ok(None)
+                Ok(BeginOutcome::Acquired(lease))
             }
         }
     }
 
-    pub async fn complete(
+    async fn complete(
         &self,
         tx_digest: &str,
         binding: &SettlementBinding,
+        lease: &LeaseToken,
         result: PaidDemoResult,
     ) -> Result<(), PaymentError> {
         let mut guard = self.inner.lock().await;
         match guard.get(tx_digest) {
             Some(State::Settling {
-                binding: existing, ..
-            }) if existing == binding => {
+                binding: existing,
+                lease: held,
+                ..
+            }) if existing == binding && held == lease => {
                 guard.insert(
                     tx_digest.into(),
                     State::Settled {
@@ -148,26 +162,35 @@ impl SettlementStore {
                 );
                 Ok(())
             }
+            Some(State::Settling { .. }) => Err(PaymentError::LeaseMismatch),
             _ => Err(PaymentError::InvalidChallenge),
         }
     }
 
-    /// Mark failed so another attempt may retry after a short bound.
-    pub async fn fail(&self, tx_digest: &str, binding: &SettlementBinding) {
+    async fn fail(
+        &self,
+        tx_digest: &str,
+        binding: &SettlementBinding,
+        lease: &LeaseToken,
+    ) -> Result<(), PaymentError> {
         let mut guard = self.inner.lock().await;
-        if matches!(
-            guard.get(tx_digest),
+        match guard.get(tx_digest) {
             Some(State::Settling {
-                binding: existing, ..
-            }) if existing == binding
-        ) {
-            guard.insert(
-                tx_digest.into(),
-                State::Failed {
-                    binding: binding.clone(),
-                    failed_at: Instant::now(),
-                },
-            );
+                binding: existing,
+                lease: held,
+                ..
+            }) if existing == binding && held == lease => {
+                guard.insert(
+                    tx_digest.into(),
+                    State::Failed {
+                        binding: binding.clone(),
+                        failed_at: Instant::now(),
+                    },
+                );
+                Ok(())
+            }
+            Some(State::Settling { .. }) => Err(PaymentError::LeaseMismatch),
+            _ => Ok(()),
         }
     }
 }
@@ -181,34 +204,16 @@ fn evict(map: &mut HashMap<String, State>) {
 }
 
 fn evict_one_targeted(map: &mut HashMap<String, State>) {
-    // Prefer failed, then oldest settled, then oldest settling.
     let key = map
         .iter()
-        .filter(|(_, s)| matches!(s, State::Failed { .. }))
-        .min_by_key(|(_, s)| match s {
-            State::Failed { failed_at, .. } => *failed_at,
-            _ => Instant::now(),
+        .filter_map(|(k, state)| match state {
+            State::Settled { completed, .. } => Some((k.clone(), completed.elapsed())),
+            State::Failed { failed_at, .. } => Some((k.clone(), failed_at.elapsed())),
+            State::Settling { .. } => None,
         })
-        .map(|(k, _)| k.clone())
-        .or_else(|| {
-            map.iter()
-                .filter(|(_, s)| matches!(s, State::Settled { .. }))
-                .min_by_key(|(_, s)| match s {
-                    State::Settled { completed, .. } => *completed,
-                    _ => Instant::now(),
-                })
-                .map(|(k, _)| k.clone())
-        })
-        .or_else(|| {
-            map.iter()
-                .min_by_key(|(_, s)| match s {
-                    State::Settling { started, .. } => *started,
-                    State::Settled { completed, .. } => *completed,
-                    State::Failed { failed_at, .. } => *failed_at,
-                })
-                .map(|(k, _)| k.clone())
-        });
-    if let Some(k) = key {
-        map.remove(&k);
+        .max_by_key(|(_, age)| *age)
+        .map(|(k, _)| k);
+    if let Some(key) = key {
+        map.remove(&key);
     }
 }

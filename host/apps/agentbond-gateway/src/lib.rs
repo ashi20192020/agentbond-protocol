@@ -1,6 +1,7 @@
 //! AgentBond HTTP gateway library (routes + state for tests).
 
 pub mod error;
+pub mod index_routes;
 pub mod state;
 
 use std::sync::Arc;
@@ -45,8 +46,28 @@ pub fn test_state(
         catalog: Arc::new(catalog),
         reader,
         facilitator,
-        challenges: Arc::new(agentbond_payments::ChallengeStore::new()),
-        settlements: Arc::new(agentbond_payments::SettlementStore::new()),
+        challenges: Arc::new(agentbond_payments::MemoryChallengeStore::new()),
+        settlements: Arc::new(agentbond_payments::MemorySettlementStore::new()),
+        db: None,
+    }
+}
+
+/// Test helper: AppState with PostgreSQL payment stores and indexed reads.
+pub fn test_state_with_db(
+    cfg: agentbond_app::AppConfig,
+    catalog: agentbond_app::ServiceCatalog,
+    reader: Arc<dyn ChainReader>,
+    facilitator: Arc<dyn agentbond_payments::FacilitatorClient>,
+    db: Arc<agentbond_db::Db>,
+) -> AppState {
+    AppState {
+        cfg: Arc::new(cfg),
+        catalog: Arc::new(catalog),
+        reader,
+        facilitator,
+        challenges: Arc::new(agentbond_db::PgChallengeStore::new(db.pool().clone())),
+        settlements: Arc::new(agentbond_db::PgSettlementStore::new(db.pool().clone())),
+        db: Some(db),
     }
 }
 
@@ -69,6 +90,17 @@ pub fn router(state: AppState, max_body: usize, timeout: Duration) -> Router {
         .route("/v1/plans/jobs/challenge", post(plan_challenge))
         .route("/v1/plans/jobs/resolve-timeout", post(plan_timeout))
         .route("/v1/x402/services/{service_id}/invoke", post(x402_invoke))
+        .route("/v1/index/status", get(index_routes::index_status))
+        .route("/v1/index/jobs", get(index_routes::index_jobs))
+        .route(
+            "/v1/index/jobs/{address}/history",
+            get(index_routes::index_job_history),
+        )
+        .route("/v1/index/providers", get(index_routes::index_providers))
+        .route(
+            "/v1/index/providers/{address}/activity",
+            get(index_routes::index_provider_activity),
+        )
         .layer(middleware::from_fn(attach_request_id))
         .layer(RequestBodyLimitLayer::new(max_body))
         .layer(TimeoutLayer::with_status_code(
@@ -120,10 +152,15 @@ async fn live() -> StatusCode {
 async fn ready(State(state): State<AppState>) -> ApiResult<Json<Value>> {
     let rpc = state.reader.ready().await;
     let fac = state.facilitator.ready().await;
-    let ok = rpc.is_ok() && fac.is_ok();
+    let db_ok = match &state.db {
+        Some(db) => db.health().await.is_ok(),
+        None => true,
+    };
+    let ok = rpc.is_ok() && fac.is_ok() && db_ok;
     let body = serde_json::json!({
         "rpc": rpc.is_ok(),
         "facilitator": fac.is_ok(),
+        "database": db_ok,
     });
     if ok {
         Ok(Json(body))

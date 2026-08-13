@@ -6,21 +6,20 @@ This repository is early. It is not production-ready and has not been audited.
 
 ## Current status
 
-**Milestone 3**
+**Milestone 4**
 
-Milestone 3 adds the offchain AgentBond platform on top of the Milestone 2 Pinocchio escrow program:
+Milestone 4 adds the durable read and recovery layer on top of Milestones 1–3:
 
-- Rust SDK (`agentbond-sdk`) for PDAs, account decoding, instruction builders, receipts, and unsigned instruction plans
-- Shared application use cases (`agentbond-app`)
-- CLI (`agentbond-cli`)
-- HTTP gateway (`agentbond-gateway`) that returns unsigned plans and never holds user private keys
-- MCP stdio server (`agentbond-mcp`, `rmcp = 3.0.1`, protocol `2026-07-28`) that builds plans and does not sign or submit them
-- Narrow x402 v2 exact-SVM resource-server adapter (`agentbond-payments`) for one paid demo route
-- Local agent simulator (`agentbond-sim`) using LiteSVM and a mock facilitator
+- PostgreSQL migrations and repositories (`agentbond-db`)
+- Yellowstone gRPC + fixture indexer (`agentbond-indexer`, `agentbond-indexer` CLI)
+- Fork-safe finalized projections (public reads are finalized-only)
+- Persistent x402 challenge and settlement recovery (memory only with explicit mock mode)
+- Indexed gateway APIs under `/v1/index/*`
+- Metrics/readiness for the indexer, Compose PostgreSQL demo, CI, and portfolio docs
 
-Milestone 1 shared types remain the source of truth for layouts, receipts, and state rules. Milestone 2 onchain security tests remain in the root workspace.
+Earlier milestones remain: shared types, Pinocchio escrow program, SDK/CLI/gateway/MCP/simulator, and the narrow unofficial x402 adapter.
 
-The project is **not production-ready** and has **not been audited**.
+The project is **not production-ready** and has **not been audited**. Indexed data is a read model and cannot move funds. Receipts prove authorship, not correctness. Persistent local settlement does not guarantee global exactly-once facilitator behavior. SAS, MPP, Token-2022, confidential transfers, TEE verification, and live deployment remain out of scope.
 
 ## Workspaces and toolchains
 
@@ -37,12 +36,16 @@ The repository uses two Cargo workspaces so Agave SBF tooling stays on Rust 1.84
 │   ├── crates/
 │   │   ├── agentbond-sdk/
 │   │   ├── agentbond-payments/
-│   │   └── agentbond-app/
-│   └── apps/
-│       ├── agentbond-cli/
-│       ├── agentbond-gateway/
-│       ├── agentbond-mcp/
-│       └── agentbond-sim/
+│   │   ├── agentbond-app/
+│   │   ├── agentbond-db/
+│   │   └── agentbond-indexer/
+│   ├── apps/
+│   │   ├── agentbond-cli/
+│   │   ├── agentbond-gateway/
+│   │   ├── agentbond-mcp/
+│   │   ├── agentbond-sim/
+│   │   └── agentbond-indexer/
+│   └── fixtures/indexer/
 ├── Cargo.toml                 # root SBF workspace; exclude = ["host"]
 ├── LICENSE
 └── README.md
@@ -160,9 +163,17 @@ POST /v1/plans/jobs/challenge
 POST /v1/plans/jobs/resolve-timeout
 
 POST /v1/x402/services/{service_id}/invoke
+
+GET  /v1/index/status
+GET  /v1/index/jobs
+GET  /v1/index/jobs/{address}/history
+GET  /v1/index/providers
+GET  /v1/index/providers/{address}/activity
 ```
 
-Production gateway uses HTTP RPC and the configured facilitator. For local smoke with mock chain/facilitator:
+Indexed endpoints return finalized projections only, include `as_of_slot`, use cursor pagination (max limit 100), and never replace live `ChainReader` validation on plan routes.
+
+Production gateway uses HTTP RPC, the configured facilitator, and PostgreSQL (`AGENTBOND_DATABASE_URL` required unless mock). For local smoke with mock chain/facilitator/memory payments:
 
 ```bash
 cd host
@@ -211,7 +222,7 @@ Exact SVM requirements include typed `extra.feePayer` (camelCase), plus optional
 5. Facilitator `settle` behind an atomic settlement state machine keyed by transaction digest: `Unseen → Settling → Settled` (120s TTL, bounded capacity, targeted eviction)
 6. HTTP 200 with resource body and `PAYMENT-RESPONSE`
 
-Exact retry after success may return the cached identical response. Concurrent duplicates do not settle twice. Different binding for the same transaction is rejected. Persistent payment recovery belongs to Milestone 4.
+Exact retry after success may return the cached identical response. Concurrent duplicates do not settle twice. Different binding for the same transaction is rejected. Production uses PostgreSQL-backed challenge and settlement stores with lease tokens; in-memory stores require explicit `AGENTBOND_USE_MOCK=1`. Local lease ownership does not guarantee global exactly-once facilitator behavior if a process crashes after remote settle and before database completion.
 
 Do not describe AgentBond escrow as x402 escrow. These rails are separate.
 
@@ -263,7 +274,29 @@ It does **not** prove that an AI result is correct, complete, or high quality.
 
 ## Legacy SPL Token limitation
 
-Milestone 2/3 support only the legacy SPL Token program and one configured settlement mint. Token-2022, transfer hooks, confidential transfers, MPP, and SAS are out of scope for Milestone 3.
+Milestone 2–4 support only the legacy SPL Token program and one configured settlement mint. Token-2022, transfer hooks, confidential transfers, MPP, and SAS remain out of scope.
+
+## Indexer
+
+```bash
+# env: AGENTBOND_DATABASE_URL, AGENTBOND_YELLOWSTONE_URL, AGENTBOND_PROGRAM_ID, …
+cargo run --manifest-path host/Cargo.toml -p agentbond-indexer-app --bin agentbond-indexer -- migrate
+cargo run --manifest-path host/Cargo.toml -p agentbond-indexer-app --bin agentbond-indexer -- run
+cargo run --manifest-path host/Cargo.toml -p agentbond-indexer-app --bin agentbond-indexer -- replay --fixture host/fixtures/indexer/lifecycle.json
+```
+
+Public projections are finalized-only. Processed updates may stage raw data. The database never authorizes token movement or signing. Yellowstone client packages used here are Apache-2.0; see [docs/third-party-licenses.md](docs/third-party-licenses.md).
+
+Local PostgreSQL only (pin `postgres:16.6-alpine`):
+
+```bash
+docker compose up -d postgres
+export AGENTBOND_DATABASE_URL=postgres://agentbond:agentbond_local_only@127.0.0.1:5433/agentbond
+```
+
+Stop with `docker compose stop postgres`. Remove the named volume only if you intend to wipe local data.
+
+See [docs/local-demo.md](docs/local-demo.md), [docs/architecture.md](docs/architecture.md), and [docs/agentbond-case-study.md](docs/agentbond-case-study.md).
 
 ## Build and test
 
@@ -287,13 +320,15 @@ cargo run --manifest-path host/Cargo.toml -p agentbond-sim
 
 Build the SBF binary before LiteSVM program tests or the simulator so they can load `target/deploy/agentbond.so`.
 
+CI also runs PostgreSQL integration tests, fixture replay, and an SBF size budget of 180,000 bytes. No workflow step contacts mainnet, devnet, Yellowstone, or a live facilitator.
+
 Current offline verification counts (no internet):
 
 - Root workspace: **127** tests passed
-- Host workspace: **49** tests passed
+- Host workspace: **61** tests passed
 - Simulator: all **6** scenarios passed
 
-Honest remaining limitations: no persistent x402 recovery, no live-cluster integration suite in CI, and the x402 adapter is not an official facilitator SDK.
+Honest remaining limitations: no live-cluster Yellowstone suite in CI; the x402 adapter is not an official facilitator SDK; SAS/MPP/Token-2022/TEE/deployment remain future work.
 
 ## Program binary size
 

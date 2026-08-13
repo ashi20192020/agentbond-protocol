@@ -2,9 +2,9 @@
 //! The paid resource is a deterministic hash echo — not an AI model.
 
 use agentbond_payments::{
-    ChallengeStore, ExactPayloadBody, MockFacilitatorClient, PAYMENT_REQUIRED, PaymentPayload,
-    ResourceInfo, SCHEME_EXACT, SettlementStore, SvmExactExtra, X402_VERSION, X402ResourceConfig,
-    invoke_paid_demo,
+    ExactPayloadBody, MemoryChallengeStore, MemorySettlementStore, MockFacilitatorClient,
+    PAYMENT_REQUIRED, PaymentPayload, ResourceInfo, SCHEME_EXACT, SvmExactExtra, X402_VERSION,
+    X402ResourceConfig, invoke_paid_demo,
 };
 use anyhow::{Result, anyhow, bail};
 use base64::Engine;
@@ -30,8 +30,8 @@ pub async fn run_x402_demo() -> Result<X402DemoOutcome> {
         service_id: "hash-demo".into(),
     };
     let facilitator = MockFacilitatorClient::new();
-    let challenges = ChallengeStore::new();
-    let settlements = SettlementStore::new();
+    let challenges = MemoryChallengeStore::new();
+    let settlements = MemorySettlementStore::new();
     let input = json!({"ping": "local-sim"});
     let now = 1_700_000_000_i64;
 

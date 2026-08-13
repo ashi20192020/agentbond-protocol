@@ -2,10 +2,11 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 
 use agentbond_app::{AppConfig, ServiceCatalog};
+use agentbond_db::{Db, PgChallengeStore, PgSettlementStore, redact_db_url};
 use agentbond_gateway::{AppState, router};
 use agentbond_payments::{
-    ChallengeStore, FacilitatorClient, HttpFacilitatorClient, MockFacilitatorClient,
-    SettlementStore,
+    FacilitatorClient, HttpFacilitatorClient, MemoryChallengeStore, MemorySettlementStore,
+    MockFacilitatorClient,
 };
 use agentbond_sdk::{ChainReader, HttpChainReader, MockChainReader};
 use tracing::{info, warn};
@@ -48,13 +49,36 @@ async fn main() -> anyhow::Result<()> {
         )
     };
 
+    let (challenges, settlements, db) = if use_mock {
+        (
+            Arc::new(MemoryChallengeStore::new()) as Arc<dyn agentbond_payments::ChallengeStore>,
+            Arc::new(MemorySettlementStore::new()) as Arc<dyn agentbond_payments::SettlementStore>,
+            None,
+        )
+    } else {
+        let database_url = std::env::var("AGENTBOND_DATABASE_URL").map_err(|_| {
+            anyhow::anyhow!("AGENTBOND_DATABASE_URL is required unless AGENTBOND_USE_MOCK=1")
+        })?;
+        info!(db = %redact_db_url(&database_url), "database configured");
+        let db = Arc::new(Db::connect(&database_url).await?);
+        db.migrate().await?;
+        (
+            Arc::new(PgChallengeStore::new(db.pool().clone()))
+                as Arc<dyn agentbond_payments::ChallengeStore>,
+            Arc::new(PgSettlementStore::new(db.pool().clone()))
+                as Arc<dyn agentbond_payments::SettlementStore>,
+            Some(db),
+        )
+    };
+
     let state = AppState {
         cfg: Arc::new(cfg.clone()),
         catalog: Arc::new(catalog),
         reader,
         facilitator,
-        challenges: Arc::new(ChallengeStore::new()),
-        settlements: Arc::new(SettlementStore::new()),
+        challenges,
+        settlements,
+        db,
     };
 
     let app = router(state, cfg.max_request_bytes, timeout);

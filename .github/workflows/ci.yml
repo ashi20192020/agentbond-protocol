@@ -1,0 +1,75 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  AGENTBOND_DATABASE_URL: postgres://agentbond:agentbond_local_only@127.0.0.1:5432/agentbond
+
+jobs:
+  root:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.84.0
+        with:
+          components: rustfmt, clippy
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: root-${{ runner.os }}-${{ hashFiles('Cargo.lock') }}
+      - run: cargo fmt --all -- --check
+      - run: cargo clippy --workspace --all-targets --all-features -- -D warnings
+      - run: cargo test --workspace --all-features
+      - run: cargo build-sbf --manifest-path programs/agentbond/Cargo.toml --features bpf-entrypoint
+      - name: SBF size budget
+        run: |
+          SIZE=$(wc -c < target/deploy/agentbond.so)
+          echo "size=$SIZE"
+          test "$SIZE" -le 180000
+      - run: git diff --check
+
+  host:
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:16.6-alpine
+        env:
+          POSTGRES_USER: agentbond
+          POSTGRES_PASSWORD: agentbond_local_only
+          POSTGRES_DB: agentbond
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U agentbond -d agentbond"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.88.0
+        with:
+          components: rustfmt, clippy
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            host/target
+          key: host-${{ runner.os }}-${{ hashFiles('host/Cargo.lock') }}
+      - run: cargo fmt --manifest-path host/Cargo.toml --all -- --check
+      - run: cargo clippy --manifest-path host/Cargo.toml --workspace --all-targets --all-features -- -D warnings
+      - run: cargo run --manifest-path host/Cargo.toml -p agentbond-indexer-app --bin agentbond-indexer -- migrate
+      - run: cargo test --manifest-path host/Cargo.toml --workspace --all-features
+      - run: cargo run --manifest-path host/Cargo.toml -p agentbond-indexer-app --bin agentbond-indexer -- replay --fixture host/fixtures/indexer/lifecycle.json
+      - run: cargo run --manifest-path host/Cargo.toml -p agentbond-sim
+      - run: git diff --check

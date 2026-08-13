@@ -1,0 +1,25 @@
+[package]
+name = "agentbond-indexer-app"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+description = "AgentBond indexer CLI"
+
+[[bin]]
+name = "agentbond-indexer"
+path = "src/main.rs"
+
+[dependencies]
+agentbond-db = { workspace = true }
+agentbond-indexer = { workspace = true }
+agentbond-sdk = { workspace = true }
+anyhow = { workspace = true }
+axum = { workspace = true }
+clap = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+solana-pubkey = { workspace = true }
+url = { workspace = true }

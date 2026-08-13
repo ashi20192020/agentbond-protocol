@@ -1,10 +1,10 @@
 use base64::Engine;
 
-use crate::challenge::PaymentChallenge;
 use crate::error::PaymentError;
 use crate::models::{
     MAX_SOLANA_TX_BYTES, PaymentPayload, PaymentRequirements, SCHEME_EXACT, X402_VERSION,
 };
+use crate::stores::PaymentChallenge;
 
 pub fn validate_payment_payload(
     payload: &PaymentPayload,
@@ -89,11 +89,7 @@ pub fn validate_requirements(
     if actual.extra.last_valid_block_height.is_some() && actual.extra.recent_blockhash.is_none() {
         return Err(PaymentError::InvalidChallenge);
     }
-    let expires_at = challenge
-        .issued_at
-        .checked_add(challenge.max_timeout_seconds as i64)
-        .ok_or(PaymentError::Expired)?;
-    if now_unix > expires_at {
+    if now_unix > challenge.expires_at {
         return Err(PaymentError::Expired);
     }
     Ok(())

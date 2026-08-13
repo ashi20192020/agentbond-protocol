@@ -1,0 +1,21 @@
+services:
+  postgres:
+    image: postgres:16.6-alpine
+    container_name: agentbond-postgres
+    environment:
+      POSTGRES_USER: agentbond
+      POSTGRES_PASSWORD: agentbond_local_only
+      POSTGRES_DB: agentbond
+    ports:
+      # Host 5433 avoids clashing with other local Postgres listeners on 5432.
+      - "5433:5432"
+    volumes:
+      - agentbond_pg_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U agentbond -d agentbond"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+volumes:
+  agentbond_pg_data:

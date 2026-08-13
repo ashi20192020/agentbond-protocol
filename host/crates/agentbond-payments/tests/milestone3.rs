@@ -1,10 +1,10 @@
 use std::sync::Arc;
 
 use agentbond_payments::{
-    ChallengeStore, ExactPayloadBody, MAX_HEADER_BYTES, MockFacilitatorClient, PaymentPayload,
-    PaymentRequired, ResourceInfo, SettlementStore, SvmExactExtra, X402_VERSION,
-    X402ResourceConfig, decode_payment_signature_header, encode_payment_required_header,
-    invoke_paid_demo, is_sensitive_header,
+    ExactPayloadBody, MAX_HEADER_BYTES, MemoryChallengeStore, MemorySettlementStore,
+    MockFacilitatorClient, PaymentPayload, PaymentRequired, ResourceInfo, SvmExactExtra,
+    X402_VERSION, X402ResourceConfig, decode_payment_signature_header,
+    encode_payment_required_header, invoke_paid_demo, is_sensitive_header,
 };
 use base64::Engine;
 use serde_json::json;
@@ -36,8 +36,8 @@ fn tx_b64() -> String {
 
 async fn issue_header(
     cfg: &X402ResourceConfig,
-    challenges: &ChallengeStore,
-    settlements: &SettlementStore,
+    challenges: &MemoryChallengeStore,
+    settlements: &MemorySettlementStore,
     fac: &MockFacilitatorClient,
     input: &serde_json::Value,
     now: i64,
@@ -73,8 +73,8 @@ async fn issue_header(
 #[tokio::test]
 async fn missing_payment_returns_402_header() {
     let fac = MockFacilitatorClient::new();
-    let challenges = ChallengeStore::new();
-    let settlements = SettlementStore::new();
+    let challenges = MemoryChallengeStore::new();
+    let settlements = MemorySettlementStore::new();
     let out = invoke_paid_demo(&cfg(), &fac, &challenges, &settlements, None, &json!({}), 1)
         .await
         .expect("ok");
@@ -91,8 +91,8 @@ async fn invalid_base64_and_oversized_header() {
 #[tokio::test]
 async fn wrong_fields_rejected() {
     let fac = MockFacilitatorClient::new();
-    let challenges = ChallengeStore::new();
-    let settlements = SettlementStore::new();
+    let challenges = MemoryChallengeStore::new();
+    let settlements = MemorySettlementStore::new();
     let c = cfg();
     let input = json!({"a":1});
     let (header, mut payload) =
@@ -118,8 +118,8 @@ async fn wrong_fields_rejected() {
 #[tokio::test]
 async fn successful_payment_and_exact_retry() {
     let fac = MockFacilitatorClient::new();
-    let challenges = ChallengeStore::new();
-    let settlements = SettlementStore::new();
+    let challenges = MemoryChallengeStore::new();
+    let settlements = MemorySettlementStore::new();
     let c = cfg();
     let input = json!({"ping":1});
     let (header, _) = issue_header(&c, &challenges, &settlements, &fac, &input, 200).await;
@@ -155,8 +155,8 @@ async fn successful_payment_and_exact_retry() {
 #[tokio::test]
 async fn concurrent_settle_once() {
     let fac = Arc::new(MockFacilitatorClient::new());
-    let challenges = Arc::new(ChallengeStore::new());
-    let settlements = Arc::new(SettlementStore::new());
+    let challenges = Arc::new(MemoryChallengeStore::new());
+    let settlements = Arc::new(MemorySettlementStore::new());
     let c = cfg();
     let input = json!({"c":1});
     let (header, _) = issue_header(&c, &challenges, &settlements, &fac, &input, 300).await;
@@ -203,8 +203,8 @@ async fn concurrent_settle_once() {
 async fn verify_and_settle_failures() {
     let fac = MockFacilitatorClient::new();
     fac.set_verify_ok(false).await;
-    let challenges = ChallengeStore::new();
-    let settlements = SettlementStore::new();
+    let challenges = MemoryChallengeStore::new();
+    let settlements = MemorySettlementStore::new();
     let c = cfg();
     let input = json!({});
     let (header, _) = issue_header(&c, &challenges, &settlements, &fac, &input, 400).await;
@@ -224,8 +224,8 @@ async fn verify_and_settle_failures() {
 
     let fac = MockFacilitatorClient::new();
     fac.set_settle_ok(false).await;
-    let challenges = ChallengeStore::new();
-    let settlements = SettlementStore::new();
+    let challenges = MemoryChallengeStore::new();
+    let settlements = MemorySettlementStore::new();
     let (header, _) = issue_header(&c, &challenges, &settlements, &fac, &input, 401).await;
     assert!(
         invoke_paid_demo(
@@ -252,8 +252,8 @@ async fn sensitive_header_redaction_helper() {
 #[tokio::test]
 async fn payment_required_encodes_fee_payer() {
     let fac = MockFacilitatorClient::new();
-    let challenges = ChallengeStore::new();
-    let settlements = SettlementStore::new();
+    let challenges = MemoryChallengeStore::new();
+    let settlements = MemorySettlementStore::new();
     let c = cfg();
     let Err(header) = invoke_paid_demo(&c, &fac, &challenges, &settlements, None, &json!({}), 1)
         .await

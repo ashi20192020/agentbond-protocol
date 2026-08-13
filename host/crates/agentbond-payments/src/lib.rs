@@ -9,9 +9,10 @@ pub mod http_util;
 pub mod models;
 pub mod resource;
 pub mod settlement;
+pub mod stores;
 pub mod validate;
 
-pub use challenge::ChallengeStore;
+pub use challenge::MemoryChallengeStore;
 pub use error::PaymentError;
 pub use facilitator::{FacilitatorClient, HttpFacilitatorClient, MockFacilitatorClient};
 pub use headers::{
@@ -21,5 +22,9 @@ pub use headers::{
 };
 pub use models::*;
 pub use resource::{PaidDemoResult, X402ResourceConfig, input_digest, invoke_paid_demo};
-pub use settlement::{SettlementBinding, SettlementStore};
+pub use settlement::{MemorySettlementStore, SettlementBinding};
+pub use stores::{
+    BeginOutcome, ChallengeStore, LeaseToken, PaymentChallenge, SettlementStore, random_memo_hex,
+    tx_digest,
+};
 pub use validate::validate_payment_payload;

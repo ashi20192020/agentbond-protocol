@@ -1,13 +1,13 @@
 use sha2::{Digest, Sha256};
 
-use crate::challenge::ChallengeStore;
 use crate::error::PaymentError;
 use crate::facilitator::FacilitatorClient;
 use crate::headers::{
     decode_payment_signature_header, encode_payment_required_header, encode_payment_response_header,
 };
 use crate::models::{PaymentRequired, ResourceInfo, SettleRequest, VerifyRequest, X402_VERSION};
-use crate::settlement::{SettlementBinding, SettlementStore};
+use crate::settlement::SettlementBinding;
+use crate::stores::{BeginOutcome, ChallengeStore, SettlementStore, tx_digest};
 use crate::validate::validate_payment_payload;
 
 #[derive(Clone, Debug)]
@@ -23,7 +23,7 @@ pub struct X402ResourceConfig {
     pub service_id: String,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct PaidDemoResult {
     pub body: serde_json::Value,
     pub payment_response_header: String,
@@ -39,8 +39,8 @@ pub fn input_digest(input: &serde_json::Value) -> Result<String, PaymentError> {
 pub async fn invoke_paid_demo(
     cfg: &X402ResourceConfig,
     facilitator: &dyn FacilitatorClient,
-    challenges: &ChallengeStore,
-    settlements: &SettlementStore,
+    challenges: &dyn ChallengeStore,
+    settlements: &dyn SettlementStore,
     payment_header: Option<&str>,
     input: &serde_json::Value,
     now_unix: i64,
@@ -87,7 +87,7 @@ pub async fn invoke_paid_demo(
         },
     };
     let tx_b64 = validate_payment_payload(&payload, &expected, &challenge, now_unix, &digest)?;
-    let tx_digest = SettlementStore::tx_digest(&tx_b64);
+    let digest_key = tx_digest(&tx_b64);
     let binding = SettlementBinding {
         service_id: cfg.service_id.clone(),
         resource_url: cfg.resource_url.clone(),
@@ -95,9 +95,10 @@ pub async fn invoke_paid_demo(
         challenge_memo: challenge.memo.clone(),
     };
 
-    if let Some(cached) = settlements.begin(&tx_digest, binding.clone()).await? {
-        return Ok(Ok(cached));
-    }
+    let lease = match settlements.begin(&digest_key, binding.clone()).await? {
+        BeginOutcome::Cached(cached) => return Ok(Ok(cached)),
+        BeginOutcome::Acquired(lease) => lease,
+    };
 
     let verify = match facilitator
         .verify(&VerifyRequest {
@@ -109,16 +110,15 @@ pub async fn invoke_paid_demo(
     {
         Ok(v) => v,
         Err(e) => {
-            settlements.fail(&tx_digest, &binding).await;
+            let _ = settlements.fail(&digest_key, &binding, &lease).await;
             return Err(e);
         }
     };
     if !verify.is_valid {
-        settlements.fail(&tx_digest, &binding).await;
+        let _ = settlements.fail(&digest_key, &binding, &lease).await;
         return Err(PaymentError::VerifyRejected);
     }
 
-    // Deterministic transform only — not an AI model.
     let input_bytes = serde_json::to_vec(input).map_err(|_| PaymentError::InvalidJson)?;
     let body_digest = Sha256::digest(&input_bytes);
     let body = serde_json::json!({
@@ -138,12 +138,12 @@ pub async fn invoke_paid_demo(
     {
         Ok(s) => s,
         Err(e) => {
-            settlements.fail(&tx_digest, &binding).await;
+            let _ = settlements.fail(&digest_key, &binding, &lease).await;
             return Err(e);
         }
     };
     if !settle.success {
-        settlements.fail(&tx_digest, &binding).await;
+        let _ = settlements.fail(&digest_key, &binding, &lease).await;
         return Err(PaymentError::SettleRejected);
     }
 
@@ -153,11 +153,7 @@ pub async fn invoke_paid_demo(
         payment_response_header: response_header,
     };
     settlements
-        .complete(&tx_digest, &binding, result.clone())
+        .complete(&digest_key, &binding, &lease, result.clone())
         .await?;
     Ok(Ok(result))
 }
-
-/// Compatibility alias removed PaymentCache — use SettlementStore.
-#[deprecated(note = "use SettlementStore")]
-pub type PaymentCache = SettlementStore;

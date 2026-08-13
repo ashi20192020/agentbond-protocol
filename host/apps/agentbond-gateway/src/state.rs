@@ -10,6 +10,7 @@ pub struct AppState {
     pub catalog: Arc<ServiceCatalog>,
     pub reader: Arc<dyn ChainReader>,
     pub facilitator: Arc<dyn FacilitatorClient>,
-    pub challenges: Arc<ChallengeStore>,
-    pub settlements: Arc<SettlementStore>,
+    pub challenges: Arc<dyn ChallengeStore>,
+    pub settlements: Arc<dyn SettlementStore>,
+    pub db: Option<Arc<agentbond_db::Db>>,
 }

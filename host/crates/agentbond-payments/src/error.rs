@@ -38,6 +38,10 @@ pub enum PaymentError {
     SettlementInProgress,
     #[error("transaction binding mismatch")]
     BindingMismatch,
+    #[error("settlement lease mismatch")]
+    LeaseMismatch,
+    #[error("internal payment error: {0}")]
+    Internal(String),
     #[error("verify rejected")]
     VerifyRejected,
     #[error("verify timeout")]

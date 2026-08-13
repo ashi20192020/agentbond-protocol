@@ -93,6 +93,8 @@ impl From<PaymentError> for ApiError {
                 (StatusCode::PAYMENT_REQUIRED, "payment_rejected")
             }
             PaymentError::SettlementInProgress => (StatusCode::CONFLICT, "settlement_in_progress"),
+            PaymentError::LeaseMismatch => (StatusCode::CONFLICT, "lease_mismatch"),
+            PaymentError::Internal(_) => (StatusCode::INTERNAL_SERVER_ERROR, "payment_internal"),
             _ => (StatusCode::BAD_REQUEST, "payment_error"),
         };
         Self::new(status, code, value.to_string())

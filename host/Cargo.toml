@@ -4,10 +4,13 @@ members = [
     "crates/agentbond-sdk",
     "crates/agentbond-payments",
     "crates/agentbond-app",
+    "crates/agentbond-db",
+    "crates/agentbond-indexer",
     "apps/agentbond-cli",
     "apps/agentbond-gateway",
     "apps/agentbond-mcp",
     "apps/agentbond-sim",
+    "apps/agentbond-indexer",
 ]
 
 [workspace.package]
@@ -22,6 +25,17 @@ agentbond-types = { path = "../crates/agentbond-types", default-features = false
 agentbond-sdk = { path = "crates/agentbond-sdk" }
 agentbond-payments = { path = "crates/agentbond-payments" }
 agentbond-app = { path = "crates/agentbond-app" }
+agentbond-db = { path = "crates/agentbond-db" }
+agentbond-indexer = { path = "crates/agentbond-indexer" }
+sqlx = { version = "0.8", default-features = false, features = ["runtime-tokio", "tls-rustls", "postgres", "migrate", "macros", "chrono", "uuid", "json", "rust_decimal"] }
+chrono = { version = "0.4", features = ["serde"] }
+rust_decimal = { version = "1", features = ["serde-with-str"] }
+futures = "0.3"
+prometheus = "0.14"
+rand = "0.9"
+yellowstone-grpc-client = "=9.1.0"
+yellowstone-grpc-proto = { version = "=9.1.0", default-features = false, features = ["tonic", "tonic-compression"] }
+getrandom = "0.3"
 
 anyhow = "1"
 bincode = "1"
