@@ -1,0 +1,64 @@
+[workspace]
+resolver = "3"
+members = [
+    "crates/agentbond-sdk",
+    "crates/agentbond-payments",
+    "crates/agentbond-app",
+    "apps/agentbond-cli",
+    "apps/agentbond-gateway",
+    "apps/agentbond-mcp",
+    "apps/agentbond-sim",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+rust-version = "1.88"
+publish = false
+
+[workspace.dependencies]
+agentbond-types = { path = "../crates/agentbond-types", default-features = false, features = ["std"] }
+agentbond-sdk = { path = "crates/agentbond-sdk" }
+agentbond-payments = { path = "crates/agentbond-payments" }
+agentbond-app = { path = "crates/agentbond-app" }
+
+anyhow = "1"
+async-trait = "0.1"
+axum = { version = "0.8", features = ["macros"] }
+base64 = "0.22"
+bs58 = "0.5"
+bytes = "1"
+clap = { version = "4.5", features = ["derive", "env"] }
+ed25519-dalek = "2"
+hex = "0.4"
+http = "1"
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+rmcp = { version = "=3.0.1", features = ["server", "transport-io"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha2 = "0.10"
+thiserror = "2"
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "signal", "time", "io-std", "fs"] }
+tower = "0.5"
+tower-http = { version = "0.6", features = ["limit", "timeout", "trace", "request-id"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
+uuid = { version = "1", features = ["v4", "serde"] }
+
+# Solana host crates (not used by SBF root workspace).
+solana-hash = "2.2"
+solana-instruction = "2.2"
+solana-keypair = "2.2"
+solana-message = "2.2"
+solana-pubkey = "2.2"
+solana-signer = "2.2"
+solana-system-interface = "1"
+solana-transaction = { version = "2.2", features = ["bincode"] }
+spl-associated-token-account-client = "2.0"
+spl-token = "7.0"
+
+# Simulator-only
+litesvm = "=0.6.1"
+solana-clock = "2.2"
+solana-compute-budget-interface = "2.2"

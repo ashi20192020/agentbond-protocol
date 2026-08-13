@@ -1,0 +1,15 @@
+{
+  "program_id": "iTRhr3SWUeJAjjSzeegGuGei5gDdCxaxhs93sotsCjo",
+  "rpc_url": "http://127.0.0.1:8899",
+  "genesis_hash": "0707070707070707070707070707070707070707070707070707070707070707",
+  "settlement_mint": "11111111111111111111111111111111",
+  "token_program": "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA",
+  "facilitator_url": "http://127.0.0.1:9090",
+  "merchant_pay_to": "11111111111111111111111111111112",
+  "x402_amount": "1000",
+  "x402_network": "solana:localnet",
+  "request_timeout_ms": 5000,
+  "max_request_bytes": 65536,
+  "bind_address": "127.0.0.1:8080",
+  "catalog_path": "config/example.catalog.json"
+}

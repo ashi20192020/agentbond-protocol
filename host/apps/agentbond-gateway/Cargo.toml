@@ -1,0 +1,39 @@
+[package]
+name = "agentbond-gateway"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+description = "AgentBond HTTP gateway (unsigned plans + x402 demo)"
+
+[lib]
+name = "agentbond_gateway"
+path = "src/lib.rs"
+
+[[bin]]
+name = "agentbond-gateway"
+path = "src/main.rs"
+
+[dependencies]
+agentbond-app = { workspace = true }
+agentbond-payments = { workspace = true }
+agentbond-sdk = { workspace = true }
+anyhow = { workspace = true }
+axum = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+solana-pubkey = { workspace = true }
+tokio = { workspace = true }
+tower = { workspace = true }
+tower-http = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+uuid = { workspace = true }
+
+[dev-dependencies]
+agentbond-types = { workspace = true }
+base64 = { workspace = true }
+http-body-util = "0.1"
+tower = { workspace = true, features = ["util"] }
+tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }

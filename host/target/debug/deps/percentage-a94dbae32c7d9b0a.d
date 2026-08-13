@@ -1,0 +1,7 @@
+/Users/ayushkumarmishra/workspace/agentbond-protocol/host/target/debug/deps/percentage-a94dbae32c7d9b0a.d: /Users/ayushkumarmishra/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/percentage-0.1.0/src/lib.rs
+
+/Users/ayushkumarmishra/workspace/agentbond-protocol/host/target/debug/deps/libpercentage-a94dbae32c7d9b0a.rlib: /Users/ayushkumarmishra/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/percentage-0.1.0/src/lib.rs
+
+/Users/ayushkumarmishra/workspace/agentbond-protocol/host/target/debug/deps/libpercentage-a94dbae32c7d9b0a.rmeta: /Users/ayushkumarmishra/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/percentage-0.1.0/src/lib.rs
+
+/Users/ayushkumarmishra/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/percentage-0.1.0/src/lib.rs:

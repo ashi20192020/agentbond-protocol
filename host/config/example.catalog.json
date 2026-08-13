@@ -1,0 +1,10 @@
+[
+  {
+    "service_id": "hash-demo",
+    "provider": "11111111111111111111111111111113",
+    "name": "Hash Demo",
+    "description": "Deterministic paid demo that hashes input bytes.",
+    "request_schema": "agentbond.demo.hash.v1",
+    "x402_demo_route": "/v1/x402/services/hash-demo/invoke"
+  }
+]

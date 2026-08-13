@@ -1,0 +1,28 @@
+[package]
+name = "agentbond-sdk"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+description = "AgentBond Solana client SDK (addresses, codecs, instruction plans)"
+
+[dependencies]
+agentbond-types = { workspace = true }
+async-trait = { workspace = true }
+base64 = { workspace = true }
+bs58 = { workspace = true }
+reqwest = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+sha2 = { workspace = true }
+solana-instruction = { workspace = true }
+solana-pubkey = { workspace = true }
+spl-associated-token-account-client = { workspace = true }
+spl-token = { workspace = true }
+thiserror = { workspace = true }
+tokio = { workspace = true }
+
+[dev-dependencies]
+serde_json = { workspace = true }
+tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
