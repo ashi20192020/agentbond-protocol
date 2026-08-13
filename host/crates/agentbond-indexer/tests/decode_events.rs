@@ -219,6 +219,26 @@ fn malformed_stack() {
 }
 
 #[test]
+fn mismatched_close_clears_stack_and_ignores_event() {
+    let program = program_id();
+    let other = other_program();
+    let event = sample_event(ProtocolEventKind::JobCreated, 42, 99);
+    // AgentBond invoke → CPI invoke → mismatched close → valid event bytes.
+    let logs = vec![
+        format!("Program {} invoke [1]", program),
+        format!("Program {} invoke [2]", other),
+        format!("Program {} success", program), // mismatch: closes wrong id
+        program_data(&event),
+    ];
+    let out =
+        extract_protocol_events(&program, "sig", 1, &logs, Commitment::Processed).expect("extract");
+    assert!(
+        out.is_empty(),
+        "mismatched close must clear stack and ignore later events"
+    );
+}
+
+#[test]
 fn failed_invocation() {
     let program = program_id();
     let other = other_program();

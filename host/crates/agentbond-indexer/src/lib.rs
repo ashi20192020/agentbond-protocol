@@ -15,5 +15,6 @@ pub use fixture::{FixtureSource, replay_fixture};
 pub use metrics::IndexerMetrics;
 pub use source::{AccountUpdate, ChainSource, ChainUpdate};
 pub use yellowstone::{
-    YellowstoneConfig, YellowstoneSource, build_subscribe_request, validate_yellowstone_url,
+    CheckpointProvider, DbCheckpointProvider, YellowstoneConfig, YellowstoneSource,
+    build_subscribe_request, subscribe_request_for_checkpoint, validate_yellowstone_url,
 };

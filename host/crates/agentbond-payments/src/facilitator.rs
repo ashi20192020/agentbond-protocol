@@ -1,7 +1,7 @@
 use async_trait::async_trait;
 use std::sync::Arc;
 use std::time::Duration;
-use tokio::sync::Mutex;
+use tokio::sync::{Mutex, Notify};
 
 use crate::error::PaymentError;
 use crate::http_util::{
@@ -137,12 +137,19 @@ impl FacilitatorClient for HttpFacilitatorClient {
     }
 }
 
+#[derive(Clone)]
+struct SettleHold {
+    entered: Arc<Notify>,
+    release: Arc<Notify>,
+}
+
 #[derive(Clone, Default)]
 pub struct MockFacilitatorClient {
     verify_ok: Arc<Mutex<bool>>,
     settle_ok: Arc<Mutex<bool>>,
     verify_delay: Arc<Mutex<Option<Duration>>>,
     settle_delay: Arc<Mutex<Option<Duration>>>,
+    settle_hold: Arc<Mutex<Option<SettleHold>>>,
     ready: Arc<Mutex<bool>>,
     verify_calls: Arc<Mutex<u64>>,
     settle_calls: Arc<Mutex<u64>>,
@@ -157,6 +164,7 @@ impl MockFacilitatorClient {
             settle_ok: Arc::new(Mutex::new(true)),
             verify_delay: Arc::new(Mutex::new(None)),
             settle_delay: Arc::new(Mutex::new(None)),
+            settle_hold: Arc::new(Mutex::new(None)),
             ready: Arc::new(Mutex::new(true)),
             verify_calls: Arc::new(Mutex::new(0)),
             settle_calls: Arc::new(Mutex::new(0)),
@@ -176,6 +184,22 @@ impl MockFacilitatorClient {
     }
     pub async fn set_settle_delay(&self, delay: Option<Duration>) {
         *self.settle_delay.lock().await = delay;
+    }
+    /// Hold the next settle call until `release_settle_hold` is called.
+    pub async fn arm_settle_hold(&self) -> Arc<Notify> {
+        let entered = Arc::new(Notify::new());
+        let release = Arc::new(Notify::new());
+        *self.settle_hold.lock().await = Some(SettleHold {
+            entered: entered.clone(),
+            release: release.clone(),
+        });
+        entered
+    }
+    pub async fn release_settle_hold(&self) {
+        if let Some(hold) = self.settle_hold.lock().await.as_ref() {
+            hold.release.notify_waiters();
+        }
+        *self.settle_hold.lock().await = None;
     }
     pub async fn set_ready(&self, ready: bool) {
         *self.ready.lock().await = ready;
@@ -219,6 +243,11 @@ impl FacilitatorClient for MockFacilitatorClient {
 
     async fn settle(&self, _request: &SettleRequest) -> Result<SettleResponse, PaymentError> {
         *self.settle_calls.lock().await += 1;
+        let hold = self.settle_hold.lock().await.clone();
+        if let Some(hold) = hold {
+            hold.entered.notify_waiters();
+            hold.release.notified().await;
+        }
         if let Some(delay) = *self.settle_delay.lock().await {
             tokio::time::sleep(delay).await;
             return Err(PaymentError::SettleTimeout);

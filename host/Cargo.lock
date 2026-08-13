@@ -124,6 +124,7 @@ dependencies = [
  "async-trait",
  "axum",
  "base64 0.22.1",
+ "futures",
  "http-body-util",
  "prometheus",
  "serde",
@@ -162,6 +163,7 @@ dependencies = [
  "tokio",
  "tracing",
  "url",
+ "wiremock",
  "yellowstone-grpc-client",
  "yellowstone-grpc-proto",
 ]

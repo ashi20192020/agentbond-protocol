@@ -67,6 +67,17 @@ impl Db {
             .into_iter()
             .map(|(v, ok, ck)| (v, (ok, ck)))
             .collect();
+        let embedded: HashMap<i64, &[u8]> = migrator
+            .iter()
+            .map(|m| (m.version, m.checksum.as_ref()))
+            .collect();
+        for version in applied_map.keys() {
+            if !embedded.contains_key(version) {
+                return Err(DbError::Migration(format!(
+                    "unknown applied migration version {version} not present in embedded migrations"
+                )));
+            }
+        }
         for m in migrator.iter() {
             let version = m.version;
             let Some((success, checksum)) = applied_map.get(&version) else {

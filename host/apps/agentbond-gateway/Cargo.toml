@@ -38,6 +38,7 @@ prometheus = { workspace = true }
 agentbond-indexer = { workspace = true }
 agentbond-types = { workspace = true }
 base64 = { workspace = true }
+futures = { workspace = true }
 http-body-util = "0.1"
 solana-pubkey = { workspace = true }
 tower = { workspace = true, features = ["util"] }

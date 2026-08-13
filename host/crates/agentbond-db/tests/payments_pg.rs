@@ -312,14 +312,23 @@ async fn simultaneous_lease_acquisition() {
     let binding = sample_binding();
     let digest = sample_tx_digest();
 
-    let first = a.begin(&digest, binding.clone()).await.expect("begin a");
-    let BeginOutcome::Acquired(_lease) = first else {
-        panic!("expected Acquired on first store");
-    };
-    let second = b.begin(&digest, binding).await;
-    assert!(
-        matches!(second, Err(PaymentError::SettlementInProgress)),
-        "second store must see InProgress, got {second:?}"
+    let (first, second) = tokio::join!(
+        a.begin(&digest, binding.clone()),
+        b.begin(&digest, binding.clone())
+    );
+    let outcomes = [first, second];
+    let acquired = outcomes
+        .iter()
+        .filter(|r| matches!(r, Ok(BeginOutcome::Acquired(_))))
+        .count();
+    let in_progress = outcomes
+        .iter()
+        .filter(|r| matches!(r, Err(PaymentError::SettlementInProgress)))
+        .count();
+    assert_eq!(acquired, 1, "exactly one Acquired, got {outcomes:?}");
+    assert_eq!(
+        in_progress, 1,
+        "exactly one SettlementInProgress, got {outcomes:?}"
     );
 }
 

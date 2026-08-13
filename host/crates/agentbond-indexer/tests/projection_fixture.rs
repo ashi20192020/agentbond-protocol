@@ -289,6 +289,98 @@ async fn finalized_cannot_downgrade_and_conflicting_ancestry() {
 }
 
 #[tokio::test]
+async fn conflicting_parents_are_rejected() {
+    let (_lock, db) = db().await;
+    let repo = ProjectionRepo::new(db.pool().clone());
+
+    repo.upsert_slot(&SlotUpdate {
+        slot: 700,
+        parent_slot: Some(699),
+        status: Commitment::Processed,
+        block_time: None,
+    })
+    .await
+    .expect("processed");
+    let err = repo
+        .upsert_slot(&SlotUpdate {
+            slot: 700,
+            parent_slot: Some(698),
+            status: Commitment::Processed,
+            block_time: None,
+        })
+        .await
+        .expect_err("processed parent conflict");
+    assert!(err.to_string().contains("parent"));
+
+    repo.upsert_slot(&SlotUpdate {
+        slot: 701,
+        parent_slot: Some(700),
+        status: Commitment::Confirmed,
+        block_time: None,
+    })
+    .await
+    .expect("confirmed");
+    let err = repo
+        .upsert_slot(&SlotUpdate {
+            slot: 701,
+            parent_slot: Some(699),
+            status: Commitment::Finalized,
+            block_time: None,
+        })
+        .await
+        .expect_err("confirmed→finalized parent conflict");
+    assert!(err.to_string().contains("parent"));
+
+    repo.upsert_slot(&SlotUpdate {
+        slot: 702,
+        parent_slot: None,
+        status: Commitment::Finalized,
+        block_time: None,
+    })
+    .await
+    .expect("finalized none");
+    let err = repo
+        .upsert_slot(&SlotUpdate {
+            slot: 702,
+            parent_slot: Some(701),
+            status: Commitment::Finalized,
+            block_time: None,
+        })
+        .await
+        .expect_err("finalized parent fill rejected");
+    assert!(err.to_string().contains("parent") || err.to_string().contains("finalization"));
+}
+
+#[tokio::test]
+async fn missing_parent_and_cycle_rejected_on_finalize() {
+    let (_lock, db) = db().await;
+    let repo = ProjectionRepo::new(db.pool().clone());
+
+    repo.upsert_slot(&SlotUpdate {
+        slot: 800,
+        parent_slot: Some(799),
+        status: Commitment::Processed,
+        block_time: None,
+    })
+    .await
+    .expect("child with missing parent");
+    let err = repo.finalize_slot(800).await.expect_err("missing parent");
+    assert!(err.to_string().contains("missing parent") || err.to_string().contains("ancestry"));
+
+    // Create a two-slot cycle via direct SQL (upsert rejects self-parent).
+    sqlx::query(
+        "INSERT INTO indexer_slots (slot, parent_slot, status, updated_at)
+         VALUES (810, 811, 'processed', NOW()), (811, 810, 'processed', NOW())
+         ON CONFLICT (slot) DO NOTHING",
+    )
+    .execute(db.pool())
+    .await
+    .expect("cycle seed");
+    let err = repo.finalize_slot(810).await.expect_err("cycle");
+    assert!(err.to_string().contains("cycle") || err.to_string().contains("ancestry"));
+}
+
+#[tokio::test]
 async fn out_of_order_slots_do_not_create_false_gaps() {
     let (_lock, db) = db().await;
     let metrics = IndexerMetrics::new().expect("metrics");

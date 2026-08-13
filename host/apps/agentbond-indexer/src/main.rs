@@ -4,8 +4,8 @@ use std::time::Duration;
 
 use agentbond_db::{Db, ProjectionRepo, redact_db_url};
 use agentbond_indexer::{
-    IndexerEngine, IndexerMetrics, RpcGapBackfill, YellowstoneConfig, YellowstoneSource,
-    replay_fixture,
+    DbCheckpointProvider, IndexerEngine, IndexerMetrics, RpcGapBackfill, YellowstoneConfig,
+    YellowstoneSource, replay_fixture,
 };
 use axum::Router;
 use axum::http::{HeaderMap, HeaderValue, StatusCode};
@@ -72,9 +72,8 @@ async fn main() -> anyhow::Result<()> {
                 }
             });
             let repo = ProjectionRepo::new(db.pool().clone());
-            let (finalized, _) = repo.checkpoint().await?;
-            let from_slot = if finalized > 0 { Some(finalized) } else { None };
-            let ys = YellowstoneConfig::from_env()?.with_from_slot(from_slot);
+            let checkpoints = Arc::new(DbCheckpointProvider::new(repo));
+            let ys = YellowstoneConfig::from_env()?;
             let rpc_url = std::env::var("AGENTBOND_RPC_URL")
                 .map_err(|_| anyhow::anyhow!("AGENTBOND_RPC_URL is required for run"))?;
             let program_id: Pubkey = std::env::var("AGENTBOND_PROGRAM_ID")
@@ -86,7 +85,7 @@ async fn main() -> anyhow::Result<()> {
                 program_id,
                 Duration::from_secs(10),
             )?);
-            let source = YellowstoneSource::new(ys, metrics.clone());
+            let source = YellowstoneSource::new(ys, metrics.clone(), checkpoints);
             let engine = IndexerEngine::new(db, metrics).with_backfill(backfill);
             engine.run_source(&source).await?;
         }

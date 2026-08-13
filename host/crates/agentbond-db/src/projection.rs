@@ -1,9 +1,14 @@
+use std::collections::HashSet;
+
 use chrono::{DateTime, TimeZone, Utc};
 use serde::{Deserialize, Serialize};
 use sqlx::{PgPool, Postgres, Transaction};
 
 use crate::error::DbError;
 use crate::util::{i64_to_u64, u64_to_i64, u64_to_numeric};
+
+/// Bound ancestry walks so finalization never issues unbounded queries.
+const MAX_ANCESTRY_DEPTH: u32 = 256;
 
 #[derive(Clone, Debug)]
 pub struct SlotUpdate {
@@ -189,6 +194,13 @@ impl ProjectionRepo {
     }
 
     pub async fn upsert_slot(&self, update: &SlotUpdate) -> Result<(), DbError> {
+        if let Some(parent) = update.parent_slot
+            && parent == update.slot
+        {
+            return Err(DbError::Conflict(
+                "conflicting parent_slot: slot cannot parent itself".into(),
+            ));
+        }
         let slot = u64_to_i64(update.slot)?;
         let parent = match update.parent_slot {
             Some(p) => Some(u64_to_i64(p)?),
@@ -199,14 +211,16 @@ impl ProjectionRepo {
             .and_then(|t| Utc.timestamp_opt(t, 0).single());
 
         let mut tx = self.pool.begin().await?;
-        let existing: Option<(String,)> =
-            sqlx::query_as("SELECT status FROM indexer_slots WHERE slot = $1 FOR UPDATE")
-                .bind(slot)
-                .fetch_optional(&mut *tx)
-                .await?;
+        let existing: Option<(String, Option<i64>)> = sqlx::query_as(
+            "SELECT status, parent_slot FROM indexer_slots WHERE slot = $1 FOR UPDATE",
+        )
+        .bind(slot)
+        .fetch_optional(&mut *tx)
+        .await?;
 
-        if let Some((status,)) = existing {
+        if let Some((status, stored_parent)) = existing {
             let current = Commitment::parse(&status)?;
+            reconcile_parent(stored_parent, parent, current)?;
             if current == Commitment::Finalized && update.status == Commitment::Dead {
                 return Err(DbError::Conflict(
                     "illegal slot status transition: finalized -> dead".into(),
@@ -224,7 +238,7 @@ impl ProjectionRepo {
             }
             sqlx::query(
                 "UPDATE indexer_slots
-                 SET parent_slot = $2,
+                 SET parent_slot = COALESCE(parent_slot, $2),
                      status = $3,
                      block_time = COALESCE($4, block_time),
                      updated_at = NOW()
@@ -606,45 +620,76 @@ async fn cleanup_dead_slot_tx(
     Ok(())
 }
 
+fn reconcile_parent(
+    stored: Option<i64>,
+    incoming: Option<i64>,
+    current: Commitment,
+) -> Result<(), DbError> {
+    match (stored, incoming) {
+        (Some(a), Some(b)) if a != b => Err(DbError::Conflict(
+            "conflicting parent_slot for existing slot".into(),
+        )),
+        (Some(_), None) => Err(DbError::Conflict(
+            "conflicting parent_slot for existing slot".into(),
+        )),
+        (None, Some(_)) if current == Commitment::Finalized => Err(DbError::Conflict(
+            "cannot set parent_slot after finalization".into(),
+        )),
+        _ => Ok(()),
+    }
+}
+
 async fn assert_ancestry(tx: &mut Transaction<'_, Postgres>, slot: u64) -> Result<(), DbError> {
     let mut current = slot;
-    let mut guarded = 0u32;
-    loop {
-        if guarded > 1_000_000 {
+    let mut visited = HashSet::new();
+    for _ in 0..MAX_ANCESTRY_DEPTH {
+        if !visited.insert(current) {
             return Err(DbError::Conflict(
-                "conflicting finalized ancestry: parent chain too deep".into(),
+                "conflicting finalized ancestry: parent cycle detected".into(),
             ));
         }
-        guarded = guarded.saturating_add(1);
-
         let row: Option<(Option<i64>,)> =
             sqlx::query_as("SELECT parent_slot FROM indexer_slots WHERE slot = $1")
                 .bind(u64_to_i64(current)?)
                 .fetch_optional(&mut **tx)
                 .await?;
         let Some((parent,)) = row else {
-            return Ok(());
+            if current == slot {
+                return Err(DbError::NotFound(format!("unknown slot {slot}")));
+            }
+            return Err(DbError::Conflict(format!(
+                "conflicting finalized ancestry: missing parent slot {current}"
+            )));
         };
         let Some(parent) = parent else {
             return Ok(());
         };
         let parent_u = i64_to_u64(parent)?;
+        if parent_u == current {
+            return Err(DbError::Conflict(
+                "conflicting finalized ancestry: self-parent".into(),
+            ));
+        }
         let parent_status: Option<(String,)> =
             sqlx::query_as("SELECT status FROM indexer_slots WHERE slot = $1")
                 .bind(parent)
                 .fetch_optional(&mut **tx)
                 .await?;
-        if let Some((status,)) = parent_status {
-            if status == "dead" {
-                return Err(DbError::Conflict(
-                    "conflicting finalized ancestry: ancestor is dead".into(),
-                ));
-            }
-            current = parent_u;
-        } else {
-            return Ok(());
+        let Some((status,)) = parent_status else {
+            return Err(DbError::Conflict(format!(
+                "conflicting finalized ancestry: missing parent slot {parent_u}"
+            )));
+        };
+        if status == "dead" {
+            return Err(DbError::Conflict(
+                "conflicting finalized ancestry: ancestor is dead".into(),
+            ));
         }
+        current = parent_u;
     }
+    Err(DbError::Conflict(
+        "conflicting finalized ancestry: parent chain too deep".into(),
+    ))
 }
 
 async fn apply_projection(

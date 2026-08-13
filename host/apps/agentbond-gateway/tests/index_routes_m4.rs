@@ -621,12 +621,38 @@ async fn two_gateway_states_share_postgres_settle_once() {
 
     let input = json!({"shared": true});
     let sig = issue_payment_sig(&app_a, input.clone(), 9).await;
-    let paid_a = paid_invoke(&app_a, &sig, input.clone()).await;
-    assert_eq!(paid_a.status(), StatusCode::OK);
+
+    let entered = fac.arm_settle_hold().await;
+    let app_a2 = app_a.clone();
+    let app_b2 = app_b.clone();
+    let sig_a = sig.clone();
+    let sig_b = sig.clone();
+    let input_a = input.clone();
+    let input_b = input.clone();
+    let t_a = tokio::spawn(async move { paid_invoke(&app_a2, &sig_a, input_a).await });
+    let t_b = tokio::spawn(async move { paid_invoke(&app_b2, &sig_b, input_b).await });
+
+    // Wait until the winner reaches facilitator settle, then collect the loser.
+    entered.notified().await;
+    let either = futures::future::select(t_a, t_b).await;
+    let (loser, winner_handle) = match either {
+        futures::future::Either::Left((r, other)) => (r.expect("join"), other),
+        futures::future::Either::Right((r, other)) => (r.expect("join"), other),
+    };
+    assert_eq!(
+        loser.status(),
+        StatusCode::CONFLICT,
+        "overlapping request must report in-progress"
+    );
     assert_eq!(fac.settle_calls().await, 1);
 
-    let paid_b = paid_invoke(&app_b, &sig, input).await;
-    assert_eq!(paid_b.status(), StatusCode::OK);
+    fac.release_settle_hold().await;
+    let winner = winner_handle.await.expect("join winner");
+    assert_eq!(winner.status(), StatusCode::OK);
+    assert_eq!(fac.settle_calls().await, 1);
+
+    let cached = paid_invoke(&app_b, &sig, input).await;
+    assert_eq!(cached.status(), StatusCode::OK);
     assert_eq!(fac.settle_calls().await, 1);
 }
 

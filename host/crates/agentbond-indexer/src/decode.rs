@@ -33,9 +33,18 @@ pub fn extract_protocol_events(
             && let Some((id, after)) = rest.split_once(' ')
         {
             if after.starts_with("invoke") {
-                if stack.len() < MAX_STACK_DEPTH {
-                    stack.push(id.to_string());
+                if let Some(depth) = parse_invoke_depth(after) {
+                    let expected = stack.len().saturating_add(1);
+                    if depth != expected {
+                        stack.clear();
+                        continue;
+                    }
                 }
+                if stack.len() >= MAX_STACK_DEPTH {
+                    stack.clear();
+                    continue;
+                }
+                stack.push(id.to_string());
                 continue;
             }
             if after.starts_with("success") || after.starts_with("failed") {
@@ -43,8 +52,9 @@ pub fn extract_protocol_events(
                     && top == id
                 {
                     stack.pop();
-                } else if !stack.is_empty() {
-                    let _ = stack.pop();
+                } else {
+                    // Mismatch must not expose an older AgentBond frame.
+                    stack.clear();
                 }
                 continue;
             }
@@ -87,6 +97,15 @@ pub fn extract_protocol_events(
         event_index = event_index.saturating_add(1);
     }
     Ok(out)
+}
+
+fn parse_invoke_depth(after: &str) -> Option<usize> {
+    let start = after.find('[')?;
+    let end = after.find(']')?;
+    if end <= start + 1 {
+        return None;
+    }
+    after[start + 1..end].parse().ok()
 }
 
 pub struct AccountDecodeInput {

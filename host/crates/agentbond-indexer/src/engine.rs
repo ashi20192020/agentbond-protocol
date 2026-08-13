@@ -73,9 +73,7 @@ impl IndexerEngine {
             ChainUpdate::Slot(slot) => {
                 // Only advance gap tracking forward; ignore older notifications.
                 if let Some(prev) = *last_slot {
-                    if slot.slot > prev + 1 {
-                        let from = prev + 1;
-                        let to = slot.slot - 1;
+                    if let Some((from, to)) = detect_forward_gap(prev, slot.slot) {
                         repo.record_gap(from, to).await?;
                         self.metrics.detected_gaps.inc();
                         warn!(from, to, "ingestion gap detected");
@@ -195,5 +193,31 @@ impl IndexerEngine {
             }
         }
         Ok(())
+    }
+}
+
+/// Forward gap between previously seen slot and a newer notification.
+/// Uses checked arithmetic so `prev == u64::MAX` cannot overflow.
+pub fn detect_forward_gap(prev: u64, slot: u64) -> Option<(u64, u64)> {
+    let next = prev.checked_add(1)?;
+    if slot > next {
+        let to = slot.checked_sub(1)?;
+        Some((next, to))
+    } else {
+        None
+    }
+}
+
+#[cfg(test)]
+mod gap_tests {
+    use super::detect_forward_gap;
+
+    #[test]
+    fn gap_at_u64_max_does_not_overflow() {
+        assert_eq!(detect_forward_gap(u64::MAX, u64::MAX), None);
+        assert_eq!(detect_forward_gap(u64::MAX, 0), None);
+        assert_eq!(detect_forward_gap(10, 12), Some((11, 11)));
+        assert_eq!(detect_forward_gap(10, 11), None);
+        assert_eq!(detect_forward_gap(10, 10), None);
     }
 }

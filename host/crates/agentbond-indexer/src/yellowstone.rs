@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use std::sync::Arc;
 use std::time::Duration;
 
 use async_trait::async_trait;
@@ -14,7 +15,7 @@ use yellowstone_grpc_proto::geyser::{
     SubscribeRequestFilterTransactions, subscribe_update::UpdateOneof,
 };
 
-use agentbond_db::{Commitment, SlotUpdate};
+use agentbond_db::{Commitment, ProjectionRepo, SlotUpdate};
 
 use crate::decode::{AccountDecodeInput, decode_account_update, extract_protocol_events};
 use crate::error::IndexerError;
@@ -53,6 +54,41 @@ impl YellowstoneConfig {
         self.from_slot = slot;
         self
     }
+}
+
+/// Supplies the latest finalized checkpoint before each Yellowstone session.
+#[async_trait]
+pub trait CheckpointProvider: Send + Sync {
+    async fn finalized_slot(&self) -> Result<Option<u64>, IndexerError>;
+}
+
+pub struct DbCheckpointProvider {
+    repo: ProjectionRepo,
+}
+
+impl DbCheckpointProvider {
+    pub fn new(repo: ProjectionRepo) -> Self {
+        Self { repo }
+    }
+}
+
+#[async_trait]
+impl CheckpointProvider for DbCheckpointProvider {
+    async fn finalized_slot(&self) -> Result<Option<u64>, IndexerError> {
+        let (finalized, _) = self.repo.checkpoint().await?;
+        Ok(if finalized > 0 { Some(finalized) } else { None })
+    }
+}
+
+/// Read the latest checkpoint and build a subscribe request (offline-testable).
+pub async fn subscribe_request_for_checkpoint(
+    cfg: &YellowstoneConfig,
+    checkpoints: &dyn CheckpointProvider,
+) -> Result<SubscribeRequest, IndexerError> {
+    let from_slot = checkpoints.finalized_slot().await?;
+    let mut cfg = cfg.clone();
+    cfg.from_slot = from_slot;
+    Ok(build_subscribe_request(&cfg))
 }
 
 pub fn validate_yellowstone_url(url: &str) -> Result<(), IndexerError> {
@@ -126,11 +162,20 @@ pub fn build_subscribe_request(cfg: &YellowstoneConfig) -> SubscribeRequest {
 pub struct YellowstoneSource {
     cfg: YellowstoneConfig,
     metrics: IndexerMetrics,
+    checkpoints: Arc<dyn CheckpointProvider>,
 }
 
 impl YellowstoneSource {
-    pub fn new(cfg: YellowstoneConfig, metrics: IndexerMetrics) -> Self {
-        Self { cfg, metrics }
+    pub fn new(
+        cfg: YellowstoneConfig,
+        metrics: IndexerMetrics,
+        checkpoints: Arc<dyn CheckpointProvider>,
+    ) -> Self {
+        Self {
+            cfg,
+            metrics,
+            checkpoints,
+        }
     }
 }
 
@@ -142,13 +187,14 @@ impl ChainSource for YellowstoneSource {
         let (tx, rx) = mpsc::channel(256);
         let cfg = self.cfg.clone();
         let metrics = self.metrics.clone();
+        let checkpoints = self.checkpoints.clone();
         tokio::spawn(async move {
             let mut attempt = 0u32;
             loop {
                 if tx.is_closed() {
                     break;
                 }
-                match run_session(&cfg, &metrics, &tx).await {
+                match run_session(&cfg, checkpoints.as_ref(), &metrics, &tx).await {
                     Ok(()) => {
                         // Successful session ended; reset backoff before reconnect if still open.
                         attempt = 0;
@@ -184,10 +230,12 @@ fn bounded_backoff(attempt: u32) -> Duration {
 
 async fn run_session(
     cfg: &YellowstoneConfig,
+    checkpoints: &dyn CheckpointProvider,
     metrics: &IndexerMetrics,
     tx: &mpsc::Sender<Result<ChainUpdate, IndexerError>>,
 ) -> Result<(), IndexerError> {
-    info!(from_slot = ?cfg.from_slot, "connecting yellowstone");
+    let request = subscribe_request_for_checkpoint(cfg, checkpoints).await?;
+    info!(from_slot = ?request.from_slot, "connecting yellowstone");
     let mut builder = GeyserGrpcClient::build_from_shared(cfg.url.clone())
         .map_err(|e| IndexerError::Source(e.to_string()))?
         .connect_timeout(cfg.connect_timeout)
@@ -207,7 +255,6 @@ async fn run_session(
         .await
         .map_err(|e| IndexerError::Source(e.to_string()))?;
 
-    let request = build_subscribe_request(cfg);
     let (_sink, mut stream) = client
         .subscribe_with_request(Some(request))
         .await
@@ -346,6 +393,18 @@ mod tokio_stream {
 mod tests {
     use super::*;
     use solana_pubkey::Pubkey;
+    use tokio::sync::Mutex;
+
+    struct MemCheckpoint {
+        slot: Mutex<Option<u64>>,
+    }
+
+    #[async_trait]
+    impl CheckpointProvider for MemCheckpoint {
+        async fn finalized_slot(&self) -> Result<Option<u64>, IndexerError> {
+            Ok(*self.slot.lock().await)
+        }
+    }
 
     #[test]
     fn subscribe_request_includes_from_slot() {
@@ -359,5 +418,28 @@ mod tests {
         let req = build_subscribe_request(&cfg);
         assert_eq!(req.from_slot, Some(42));
         assert!(req.accounts.contains_key("agentbond"));
+    }
+
+    #[tokio::test]
+    async fn second_session_uses_advanced_checkpoint() {
+        let cfg = YellowstoneConfig {
+            url: "http://127.0.0.1:10000".into(),
+            x_token: None,
+            program_id: Pubkey::new_from_array([7u8; 32]),
+            connect_timeout: Duration::from_secs(1),
+            from_slot: None,
+        };
+        let cp = MemCheckpoint {
+            slot: Mutex::new(Some(10)),
+        };
+        let first = subscribe_request_for_checkpoint(&cfg, &cp)
+            .await
+            .expect("first");
+        assert_eq!(first.from_slot, Some(10));
+        *cp.slot.lock().await = Some(50);
+        let second = subscribe_request_for_checkpoint(&cfg, &cp)
+            .await
+            .expect("second");
+        assert_eq!(second.from_slot, Some(50));
     }
 }

@@ -1,6 +1,8 @@
 use std::time::Duration;
 
 use async_trait::async_trait;
+use bytes::Bytes;
+use futures::StreamExt;
 use serde_json::Value;
 use solana_pubkey::Pubkey;
 use tracing::warn;
@@ -101,13 +103,7 @@ impl RpcGapBackfill {
             .await
             .map_err(|e| IndexerError::Backfill(e.to_string()))?;
         let status = resp.status();
-        let bytes = resp
-            .bytes()
-            .await
-            .map_err(|e| IndexerError::Backfill(e.to_string()))?;
-        if bytes.len() > MAX_RPC_BYTES {
-            return Err(IndexerError::Backfill("rpc response too large".into()));
-        }
+        let bytes = read_body_bounded(resp, MAX_RPC_BYTES).await?;
         let v: Value =
             serde_json::from_slice(&bytes).map_err(|e| IndexerError::Backfill(e.to_string()))?;
         if !status.is_success() {
@@ -120,6 +116,23 @@ impl RpcGapBackfill {
             .cloned()
             .ok_or_else(|| IndexerError::Backfill("rpc missing result".into()))
     }
+}
+
+/// Stream an HTTP body and stop as soon as it exceeds `max_bytes`.
+pub async fn read_body_bounded(
+    response: reqwest::Response,
+    max_bytes: usize,
+) -> Result<Bytes, IndexerError> {
+    let mut out = Vec::new();
+    let mut stream = response.bytes_stream();
+    while let Some(chunk) = stream.next().await {
+        let chunk = chunk.map_err(|e| IndexerError::Backfill(e.to_string()))?;
+        if out.len().saturating_add(chunk.len()) > max_bytes {
+            return Err(IndexerError::Backfill("rpc response too large".into()));
+        }
+        out.extend_from_slice(&chunk);
+    }
+    Ok(Bytes::from(out))
 }
 
 #[async_trait]
@@ -219,5 +232,37 @@ impl GapBackfill for RpcGapBackfill {
             Ok(_) => Ok(false),
             Err(e) => Err(e),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use wiremock::matchers::method;
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    #[tokio::test]
+    async fn oversized_streaming_rpc_body_is_rejected() {
+        let server = MockServer::start().await;
+        let huge = vec![b'x'; MAX_RPC_BYTES.saturating_add(1)];
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(huge))
+            .mount(&server)
+            .await;
+
+        let client = reqwest::Client::new();
+        let resp = client
+            .post(server.uri())
+            .body("{}")
+            .send()
+            .await
+            .expect("send");
+        let err = read_body_bounded(resp, MAX_RPC_BYTES)
+            .await
+            .expect_err("oversized");
+        assert!(
+            err.to_string().contains("too large"),
+            "unexpected error: {err}"
+        );
     }
 }
